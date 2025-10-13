@@ -1094,7 +1094,7 @@ System Boot
 │ • Create /dev/nvidia-uvm                                    │
 │ • Initialize VA space infrastructure                        │
 │ • Setup fault handling (replayable/non-replayable)          │
-│ • Register GPU callbacks for device add/remove             │
+│ • Register GPU callbacks for device add/remove              │
 └─────────────────────────────────────────────────────────────┘
     ↓
 ┌─────────────────────────────────────────────────────────────┐
@@ -1692,7 +1692,7 @@ nvidia-smi dmon -s pucvmet
 **In-Tree Documentation:**
 - `README.md` files in each major directory
 - Header file comments (especially SDK headers)
-- This document and component-specific ANALYSIS.md files
+- This document and component-specific analysis files
 
 **External Resources:**
 - CUDA Programming Guide: GPU computing model
