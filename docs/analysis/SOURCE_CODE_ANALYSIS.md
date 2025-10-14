@@ -9,26 +9,26 @@
 
 ## Introduction: Inside the Engine Room of Modern GPUs
 
-In May 2022, NVIDIA made a decision that would fundamentally alter the landscape of GPU computing on Linux: they open-sourced the kernel-mode components of their GPU driver. This wasn't a simple code dump—it was the release of over 935,000 lines of production-quality, battle-tested code that powers everything from consumer gaming rigs to the world's fastest supercomputers. For the first time, developers, researchers, and engineers could peer inside the machinery that manages some of the most complex hardware ever created.
+In May 2022, NVIDIA made a decision that would fundamentally alter the landscape of GPU computing on Linux: they open-sourced the kernel-mode components of their GPU driver. This wasn't a simple code dump. Instead, it was the release of over 935,000 lines of production-quality, battle-tested code that powers everything from consumer gaming rigs to the world's fastest supercomputers. For the first time, developers, researchers, and engineers could peer inside the machinery that manages some of the most complex hardware ever created.
 
-This document represents a comprehensive deep-dive into that codebase—a technical autopsy of one of the most sophisticated device drivers in the Linux ecosystem. Over the course of this analysis, we've examined every major subsystem, traced data flows through multiple abstraction layers, and documented architectural decisions that span over a decade of GPU evolution. What emerges is not just a driver, but a masterclass in systems programming: how to manage heterogeneous computing resources, how to maintain binary compatibility across wildly different hardware generations, and how to balance the competing demands of performance, security, and maintainability.
+This document represents a comprehensive deep-dive into that codebase, providing a technical autopsy of one of the most sophisticated device drivers in the Linux ecosystem. Over the course of this analysis, we've examined every major subsystem, traced data flows through multiple abstraction layers, and documented architectural decisions that span over a decade of GPU evolution. What emerges is not just a driver, but a masterclass in systems programming: how to manage heterogeneous computing resources, how to maintain binary compatibility across wildly different hardware generations, and how to balance the competing demands of performance, security, and maintainability.
 
 ### What You'll Discover
 
 This analysis reveals the inner workings of a driver that must simultaneously:
-- Support nine distinct GPU architectures from 2014's Maxwell through 2024's Blackwell—each with fundamentally different hardware capabilities
+- Support nine distinct GPU architectures from 2014's Maxwell through 2024's Blackwell, each with fundamentally different hardware capabilities
 - Provide unified memory semantics across CPU and GPU address spaces, transparently migrating data at microsecond timescales
 - Drive displays at 8K resolution with HDR color while maintaining frame-perfect timing
 - Coordinate high-speed interconnects capable of 150 GB/s per link between dozens of GPUs
 - Secure computation in confidential computing environments where even the host OS is untrusted
 
-We'll explore how the driver accomplishes these feats through sophisticated architectural patterns: Hardware Abstraction Layers that enable runtime polymorphism in C, lock-free message queues that coordinate between CPU and GPU firmware, and a build system so comprehensive it automatically adapts to six years of Linux kernel API evolution. Along the way, we'll encounter some surprising design decisions—like why DisplayPort is implemented in C++ in an otherwise pure-C codebase, or why NVIDIA built a custom code generator to bring object-oriented programming to kernel code.
+We'll explore how the driver accomplishes these feats through sophisticated architectural patterns: Hardware Abstraction Layers that enable runtime polymorphism in C, lock-free message queues that coordinate between CPU and GPU firmware, and a build system so comprehensive it automatically adapts to six years of Linux kernel API evolution. Along the way, we'll encounter some surprising design decisions, like why DisplayPort is implemented in C++ in an otherwise pure-C codebase, or why NVIDIA built a custom code generator to bring object-oriented programming to kernel code.
 
 ### A Hybrid Architecture Story
 
-Perhaps the most fascinating aspect is the hybrid open/proprietary architecture. The driver strategically divides functionality: OS integration code remains fully open for community review and improvement, while hardware-specific initialization sequences and scheduling algorithms remain proprietary, protecting decades of accumulated GPU engineering knowledge. This isn't just a business decision—it's an architectural philosophy that enables NVIDIA to maintain a single driver codebase across multiple operating systems while allowing each platform's community to optimize their specific integration points.
+Perhaps the most fascinating aspect is the hybrid open/proprietary architecture. The driver strategically divides functionality: OS integration code remains fully open for community review and improvement, while hardware-specific initialization sequences and scheduling algorithms remain proprietary, protecting decades of accumulated GPU engineering knowledge. This isn't just a business decision. Rather, it's an architectural philosophy that enables NVIDIA to maintain a single driver codebase across multiple operating systems while allowing each platform's community to optimize their specific integration points.
 
-Particularly noteworthy is the **Unified Virtual Memory (UVM)** subsystem—103,318 lines of fully open-source code that rivals the Linux kernel's own memory management in sophistication. UVM implements automatic page migration between CPU and GPU, thrashing detection, multi-GPU coherence, and hardware-assisted access tracking. It represents NVIDIA's largest commitment to open-source infrastructure and demonstrates that advanced GPU features can be fully open while maintaining competitive performance.
+Particularly noteworthy is the **Unified Virtual Memory (UVM)** subsystem, consisting of 103,318 lines of fully open-source code that rivals the Linux kernel's own memory management in sophistication. UVM implements automatic page migration between CPU and GPU, thrashing detection, multi-GPU coherence, and hardware-assisted access tracking. It represents NVIDIA's largest commitment to open-source infrastructure and demonstrates that advanced GPU features can be fully open while maintaining competitive performance.
 
 ### Who Should Read This
 
@@ -44,9 +44,9 @@ Each section is designed to be self-contained while contributing to a holistic u
 
 ### A Journey Through Complexity
 
-The journey ahead takes us through five kernel modules, dozens of sophisticated subsystems, and hundreds of thousands of lines of carefully crafted code. We'll start with an architectural overview that establishes the mental model, then dive deep into each major component—from the kernel interface layer that speaks Linux's language, to the Resource Manager core that orchestrates GPU hardware, to the display engine that puts pixels on your screen. We'll examine how these components interact during critical operations like memory allocation, command submission, and display mode changes. Finally, we'll step back to discuss the broader architectural insights and design patterns that emerge from this analysis.
+The journey ahead takes us through five kernel modules, dozens of sophisticated subsystems, and hundreds of thousands of lines of carefully crafted code. We'll start with an architectural overview that establishes the mental model, then dive deep into each major component: from the kernel interface layer that speaks Linux's language, to the Resource Manager core that orchestrates GPU hardware, to the display engine that puts pixels on your screen. We'll examine how these components interact during critical operations like memory allocation, command submission, and display mode changes. Finally, we'll step back to discuss the broader architectural insights and design patterns that emerge from this analysis.
 
-This is more than documentation—it's a guided tour through one of the most impressive examples of systems engineering in modern computing. Let's begin.
+This is more than documentation. It's a guided tour through one of the most impressive examples of systems engineering in modern computing. Let's begin.
 
 ---
 
@@ -69,7 +69,7 @@ This is more than documentation—it's a guided tour through one of the most imp
 
 ## 1. Executive Summary
 
-The NVIDIA Open GPU Kernel Modules represent a landmark achievement in GPU driver engineering, encompassing **over 935,000 lines of sophisticated, production-quality code** that supports comprehensive GPU management across nine distinct hardware architectures spanning from Maxwell (2014) through the latest Blackwell generation (2024). This massive codebase provides full Linux kernel integration for NVIDIA GPUs, supporting kernel versions 4.15 and later—effectively covering over six years of Linux kernel evolution with a single, unified driver implementation.
+The NVIDIA Open GPU Kernel Modules represent a landmark achievement in GPU driver engineering, encompassing **over 935,000 lines of sophisticated, production-quality code** that supports comprehensive GPU management across nine distinct hardware architectures spanning from Maxwell (2014) through the latest Blackwell generation (2024). This massive codebase provides full Linux kernel integration for NVIDIA GPUs, supporting kernel versions 4.15 and later, effectively covering over six years of Linux kernel evolution with a single, unified driver implementation.
 
 This comprehensive analysis examines the complete driver stack in unprecedented detail, covering five distinct kernel modules, extensive common libraries providing foundational services, and comprehensive hardware support infrastructure that bridges the gap between Linux kernel abstractions and GPU-specific hardware capabilities. The driver architecture demonstrates sophisticated engineering across multiple dimensions: resource management, memory virtualization, display pipeline control, high-speed interconnect management, and security-critical operations.
 
@@ -104,7 +104,7 @@ The driver embodies a layered abstraction philosophy with clear separation of co
 
 ## 2. Overall Architecture Overview
 
-Having established the scope and scale of the NVIDIA driver codebase, we now turn to understanding its fundamental architecture. The driver's design reflects decades of evolutionary refinement, balancing the competing demands of performance, maintainability, and hardware abstraction. In this section, we'll build a mental model of how the various components fit together—from user-space applications down to the hardware registers themselves—and explore the initialization sequences that bring a GPU from cold silicon to a fully operational compute and graphics engine.
+Having established the scope and scale of the NVIDIA driver codebase, we now turn to understanding its fundamental architecture. The driver's design reflects decades of evolutionary refinement, balancing the competing demands of performance, maintainability, and hardware abstraction. In this section, we'll build a mental model of how the various components fit together, spanning from user-space applications down to the hardware registers themselves, and explore the initialization sequences that bring a GPU from cold silicon to a fully operational compute and graphics engine.
 
 The architecture exhibits a clear philosophy: separate concerns through well-defined abstraction boundaries, but optimize relentlessly within those boundaries. We'll see how this philosophy manifests in the layering of kernel modules, the isolation of OS-specific code from hardware logic, and the careful choreography of initialization dependencies. Understanding this architecture is essential for making sense of the detailed component analyses that follow.
 
@@ -223,7 +223,7 @@ System Boot
 
 ## 3. Component Analysis
 
-With the architectural overview providing our map, we now embark on a detailed exploration of each major component in the driver stack. This journey takes us through over 3,000 files and 935,000 lines of code, examining the implementation details, design patterns, and engineering trade-offs that define each subsystem. Rather than a dry catalog of functions and data structures, this analysis reveals the *why* behind the *what*—the reasoning that led to particular architectural choices and the lessons embedded in this production code.
+With the architectural overview providing our map, we now embark on a detailed exploration of each major component in the driver stack. This journey takes us through over 3,000 files and 935,000 lines of code, examining the implementation details, design patterns, and engineering trade-offs that define each subsystem. Rather than a dry catalog of functions and data structures, this analysis reveals the *why* behind the *what*: the reasoning that led to particular architectural choices and the lessons embedded in this production code.
 
 We'll proceed from the outside in: starting with the kernel interface layer that presents a Linux face to the world, moving through the common libraries that provide foundational services, diving into the core GPU driver that orchestrates hardware, and concluding with the display subsystem that brings pixels to your screen. Each component tells part of a larger story about how modern GPU drivers manage complexity while delivering exceptional performance.
 
@@ -359,7 +359,7 @@ The UVM fault handling subsystem implements sophisticated batched processing str
 
 **Physical Memory Allocator** (`uvm_pmm_gpu.c` - 37,758 lines)
 
-The Physical Memory Allocator (PMA) implements a chunk-based allocation strategy operating on root chunks sized at either 2MB or 512MB, depending on GPU generation and memory configuration. This allocator maintains strict separation between user-accessible and kernel-reserved memory regions, preventing user code from corrupting driver data structures. When GPU memory becomes oversubscribed—a common scenario in virtualized environments or when running multiple workloads—the eviction subsystem selectively migrates less-frequently-used pages back to system memory, maintaining the illusion of abundant GPU memory. A critical component is the reverse map tracking system, which maintains bidirectional mappings between GPU physical addresses and CPU virtual addresses, enabling efficient page migration and coherency operations.
+The Physical Memory Allocator (PMA) implements a chunk-based allocation strategy operating on root chunks sized at either 2MB or 512MB, depending on GPU generation and memory configuration. This allocator maintains strict separation between user-accessible and kernel-reserved memory regions, preventing user code from corrupting driver data structures. When GPU memory becomes oversubscribed (a common scenario in virtualized environments or when running multiple workloads), the eviction subsystem selectively migrates less-frequently-used pages back to system memory, maintaining the illusion of abundant GPU memory. A critical component is the reverse map tracking system, which maintains bidirectional mappings between GPU physical addresses and CPU virtual addresses, enabling efficient page migration and coherency operations.
 
 **Access Counters** (Volta+) - Hardware-Assisted Migration Intelligence
 
@@ -1222,7 +1222,7 @@ nvKmsKapiGetFunctionsTable() → struct NvKmsKapiFunctionsTable {
 
 ## 4. Component Interaction and Data Flow
 
-Understanding individual components provides necessary foundation, but the true complexity—and elegance—of the driver emerges when we examine how these components interact. A GPU driver isn't a collection of independent modules; it's a carefully choreographed symphony where timing, ordering, and communication patterns matter as much as the individual implementations. This section traces the critical data flows that define driver operation: how the system bootstraps from cold start to operational state, how memory requests traverse multiple abstraction layers, how display updates propagate from application to screen, and how compute workloads journey from CPU submission to GPU execution.
+Understanding individual components provides necessary foundation, but the true complexity (and elegance) of the driver emerges when we examine how these components interact. A GPU driver isn't a collection of independent modules; it's a carefully choreographed symphony where timing, ordering, and communication patterns matter as much as the individual implementations. This section traces the critical data flows that define driver operation: how the system bootstraps from cold start to operational state, how memory requests traverse multiple abstraction layers, how display updates propagate from application to screen, and how compute workloads journey from CPU submission to GPU execution.
 
 These interaction patterns reveal design decisions that aren't visible when examining components in isolation. We'll see how dependency ordering during initialization prevents subtle race conditions, how memory management layers coordinate to maintain performance while ensuring correctness, and how the display pipeline achieves microsecond timing precision despite passing through numerous software layers. Understanding these flows transforms our view from "what the code does" to "how the system works as a whole."
 
