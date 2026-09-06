@@ -1017,6 +1017,59 @@ static NV_STATUS uvm_api_pageable_mem_access(UVM_PAGEABLE_MEM_ACCESS_PARAMS *par
     return NV_OK;
 }
 
+NV_STATUS uvm_api_gpu_storage_decide(UVM_GPU_STORAGE_DECIDE_PARAMS *params, struct file *filp)
+{
+    uvm_bpf_storage_decision_ctx_t decision = {0};
+
+    params->callerTgid = task_tgid_nr(current);
+    params->action = UVM_GPU_STORAGE_ACTION_SUBMIT_NOW;
+    params->outputPriority =
+        (params->inputPriority > UVM_GPU_STORAGE_MAX_PRIORITY) ?
+        UVM_GPU_STORAGE_MAX_PRIORITY : params->inputPriority;
+    params->deferNs = 0;
+    params->batchTarget = UVM_GPU_STORAGE_MIN_BATCH_TARGET;
+
+    if (params->abiVersion != UVM_GPU_STORAGE_ABI_VERSION ||
+        (params->op != UVM_GPU_STORAGE_OP_READ &&
+         params->op != UVM_GPU_STORAGE_OP_WRITE) ||
+        (params->requestFlags & ~UVM_GPU_STORAGE_REQUEST_FLAGS_ALL) ||
+        params->hbmPressurePermille > 1000) {
+        // Invalid requests fall back to the SUBMIT_NOW defaults, never BPF.
+        return NV_OK;
+    }
+
+    decision.request.abi_version = params->abiVersion;
+    decision.request.op = params->op;
+    decision.request.request_flags = params->requestFlags;
+    decision.request.input_priority = params->inputPriority;
+    decision.request.request_id = params->requestId;
+    decision.request.object_id = params->objectId;
+    decision.request.bytes = params->bytes;
+    decision.request.tenant_id = params->tenantId;
+    decision.request.caller_hint = params->callerHint;
+    decision.request.deadline_ns = params->deadlineNs;
+    decision.request.slack_ns = params->slackNs;
+    decision.request.estimated_transfer_ns = params->estimatedTransferNs;
+    decision.request.recompute_ns = params->recomputeNs;
+    decision.request.queue_depth = params->queueDepth;
+    decision.request.hbm_pressure_permille = params->hbmPressurePermille;
+
+    // The attached policy (if any) is always consulted.
+    uvm_bpf_call_gpu_storage_decide(&decision);
+
+    // Missing policy, no registered program, or an unrecorded decision all
+    // keep the SUBMIT_NOW defaults.
+    if (decision.recorded &&
+        decision.decision.action <= UVM_GPU_STORAGE_ACTION_RECOMPUTE) {
+        params->action = decision.decision.action;
+        params->outputPriority = decision.decision.priority;
+        params->deferNs = decision.decision.defer_ns;
+        params->batchTarget = decision.decision.batch_target;
+    }
+
+    return NV_OK;
+}
+
 static long uvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 {
     switch (cmd)
@@ -1026,6 +1079,7 @@ static long uvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 
         UVM_ROUTE_CMD_STACK_NO_INIT_CHECK(UVM_INITIALIZE,                  uvm_api_initialize);
         UVM_ROUTE_CMD_STACK_NO_INIT_CHECK(UVM_MM_INITIALIZE,               uvm_api_mm_initialize);
+        UVM_ROUTE_CMD_STACK_NO_INIT_CHECK(UVM_GPU_STORAGE_DECIDE,          uvm_api_gpu_storage_decide);
 
         UVM_ROUTE_CMD_STACK_INIT_CHECK(UVM_PAGEABLE_MEM_ACCESS,            uvm_api_pageable_mem_access);
         UVM_ROUTE_CMD_STACK_INIT_CHECK(UVM_PAGEABLE_MEM_ACCESS_ON_GPU,     uvm_api_pageable_mem_access_on_gpu);

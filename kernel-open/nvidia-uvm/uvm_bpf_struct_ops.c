@@ -7,6 +7,7 @@
 #include <linux/proc_fs.h>
 #include <linux/seq_file.h>
 #include <linux/bpf_verifier.h>
+#include "uvm_ioctl.h"
 #include "uvm_bpf_struct_ops.h"
 
 /* Compatibility definitions for lower kernel versions */
@@ -59,9 +60,21 @@ struct gpu_mem_ops {
 };
 
 
+/* Shared struct_ops definition between kernel module and BPF program.
+ * The storage policy hook takes the callback-local context carrying all
+ * request inputs; the BPF program records its decision with
+ * bpf_gpu_storage_record(). The kernel handler never sees or stores an fd,
+ * file offset, GPU pointer, CUDA stream, or completion. */
+struct gpu_storage_ops {
+	int (*gpu_storage_decide)(
+		uvm_bpf_storage_decision_ctx_t *decision_ctx);
+};
+
+
 /* Define our custom struct_ops operations */
 /* Global instance that BPF programs will implement */
 static struct gpu_mem_ops __rcu *uvm_ops;
+static struct gpu_storage_ops __rcu *uvm_storage_ops;
 
 /* Proc file to trigger the struct_ops */
 static struct proc_dir_entry *trigger_file;
@@ -115,6 +128,12 @@ static int gpu_mem_ops__gpu_evict_prepare(
 	return UVM_BPF_ACTION_DEFAULT;
 }
 
+static int gpu_storage_ops__gpu_storage_decide(
+	uvm_bpf_storage_decision_ctx_t *decision_ctx)
+{
+	return 0;
+}
+
 /* CFI stubs structure */
 static struct gpu_mem_ops __bpf_ops_gpu_mem_ops = {
 	.gpu_test_trigger = gpu_mem_ops__gpu_test_trigger,
@@ -123,6 +142,10 @@ static struct gpu_mem_ops __bpf_ops_gpu_mem_ops = {
 	.gpu_block_activate = gpu_mem_ops__gpu_block_activate,
 	.gpu_block_access = gpu_mem_ops__gpu_block_access,
 	.gpu_evict_prepare = gpu_mem_ops__gpu_evict_prepare,
+};
+
+static struct gpu_storage_ops __bpf_ops_gpu_storage_ops = {
+	.gpu_storage_decide = gpu_storage_ops__gpu_storage_decide,
 };
 
 /* Begin kfunc definitions */
@@ -161,6 +184,59 @@ __bpf_kfunc int bpf_gpu_request_reorder(uvm_bpf_pmm_decision_ctx_t *decision_ctx
 					    position);
 }
 
+/* Record the storage scheduling decision chosen by the BPF program.
+ * An out-of-range action, a DEFER without the SAFE_TO_DEFER request flag,
+ * or a RECOMPUTE that is not READ or lacks the RECOMPUTABLE request flag
+ * all fall back to SUBMIT_NOW with
+ * defer_ns 0 and batch_target 1. A valid decision is clamped: defer_ns to
+ * the 10 ms maximum, priority to the maximum, batch_target to 1..64. */
+__bpf_kfunc int bpf_gpu_storage_record(uvm_bpf_storage_decision_ctx_t *decision_ctx,
+				      u32 action,
+				      u64 defer_ns,
+				      u32 priority,
+				      u32 batch_target)
+{
+	if (!decision_ctx)
+		return NV_GPU_TRANSITION_REJECT_IDENTITY;
+
+	if (action > UVM_GPU_STORAGE_ACTION_RECOMPUTE)
+		action = UVM_GPU_STORAGE_ACTION_SUBMIT_NOW;
+
+	if (action == UVM_GPU_STORAGE_ACTION_DEFER &&
+	    !(decision_ctx->request.request_flags &
+	      UVM_GPU_STORAGE_REQUEST_FLAG_SAFE_TO_DEFER))
+		action = UVM_GPU_STORAGE_ACTION_SUBMIT_NOW;
+
+	if (action == UVM_GPU_STORAGE_ACTION_RECOMPUTE &&
+	    (decision_ctx->request.op != UVM_GPU_STORAGE_OP_READ ||
+	     !(decision_ctx->request.request_flags &
+	       UVM_GPU_STORAGE_REQUEST_FLAG_RECOMPUTABLE)))
+		action = UVM_GPU_STORAGE_ACTION_SUBMIT_NOW;
+
+	decision_ctx->decision.action = action;
+	if (action == UVM_GPU_STORAGE_ACTION_SUBMIT_NOW) {
+		decision_ctx->decision.defer_ns = 0;
+		decision_ctx->decision.batch_target = UVM_GPU_STORAGE_MIN_BATCH_TARGET;
+	}
+	else {
+		decision_ctx->decision.defer_ns =
+			(defer_ns < UVM_GPU_STORAGE_MAX_DEFER_NS) ?
+			defer_ns : UVM_GPU_STORAGE_MAX_DEFER_NS;
+		decision_ctx->decision.batch_target =
+			(batch_target < UVM_GPU_STORAGE_MIN_BATCH_TARGET) ?
+			UVM_GPU_STORAGE_MIN_BATCH_TARGET :
+			(batch_target > UVM_GPU_STORAGE_MAX_BATCH_TARGET) ?
+			UVM_GPU_STORAGE_MAX_BATCH_TARGET :
+			batch_target;
+	}
+	decision_ctx->decision.priority =
+		(priority <= UVM_GPU_STORAGE_MAX_PRIORITY) ?
+		priority : UVM_GPU_STORAGE_MAX_PRIORITY;
+	decision_ctx->recorded = 1;
+
+	return 0;
+}
+
 /* End kfunc definitions */
 __bpf_kfunc_end_defs();
 
@@ -169,6 +245,7 @@ BTF_KFUNCS_START(uvm_bpf_kfunc_ids_set)
 BTF_ID_FLAGS(func, bpf_gpu_strstr)
 BTF_ID_FLAGS(func, bpf_gpu_set_prefetch_region, KF_TRUSTED_ARGS)
 BTF_ID_FLAGS(func, bpf_gpu_request_reorder, KF_TRUSTED_ARGS)
+BTF_ID_FLAGS(func, bpf_gpu_storage_record, KF_TRUSTED_ARGS)
 BTF_KFUNCS_END(uvm_bpf_kfunc_ids_set)
 
 /* Register the kfunc ID set */
@@ -250,6 +327,30 @@ static void gpu_mem_ops_unreg(void *kdata, struct bpf_link *link)
 	pr_info("gpu_mem_ops unregistered from nvidia-uvm\n");
 }
 
+static int gpu_storage_ops_reg(void *kdata, struct bpf_link *link)
+{
+	struct gpu_storage_ops *ops = kdata;
+
+	/* Only one instance at a time */
+	if (cmpxchg(&uvm_storage_ops, NULL, ops) != NULL)
+		return -EEXIST;
+
+	pr_info("gpu_storage_ops registered in nvidia-uvm\n");
+	return 0;
+}
+
+static void gpu_storage_ops_unreg(void *kdata, struct bpf_link *link)
+{
+	struct gpu_storage_ops *ops = kdata;
+
+	if (cmpxchg(&uvm_storage_ops, ops, NULL) != ops) {
+		pr_warn("gpu_storage_ops: unexpected unreg in nvidia-uvm\n");
+		return;
+	}
+
+	pr_info("gpu_storage_ops unregistered from nvidia-uvm\n");
+}
+
 /* Struct ops definition */
 static struct bpf_struct_ops gpu_mem_ops_struct_ops = {
 	.verifier_ops = &gpu_mem_ops_verifier_ops,
@@ -259,6 +360,17 @@ static struct bpf_struct_ops gpu_mem_ops_struct_ops = {
 	.unreg = gpu_mem_ops_unreg,
 	.cfi_stubs = &__bpf_ops_gpu_mem_ops,
 	.name = "gpu_mem_ops",
+	.owner = THIS_MODULE,
+};
+
+static struct bpf_struct_ops gpu_storage_ops_struct_ops = {
+	.verifier_ops = &gpu_mem_ops_verifier_ops,
+	.init = gpu_mem_ops_init,
+	.init_member = gpu_mem_ops_init_member,
+	.reg = gpu_storage_ops_reg,
+	.unreg = gpu_storage_ops_unreg,
+	.cfi_stubs = &__bpf_ops_gpu_storage_ops,
+	.name = "gpu_storage_ops",
 	.owner = THIS_MODULE,
 };
 
@@ -322,6 +434,13 @@ int uvm_bpf_struct_ops_init(void)
 	ret = register_bpf_struct_ops(&gpu_mem_ops_struct_ops, gpu_mem_ops);
 	if (ret) {
 		pr_err("UVM: Failed to register struct_ops: %d\n", ret);
+		return ret;
+	}
+
+	/* Register the storage policy struct_ops */
+	ret = register_bpf_struct_ops(&gpu_storage_ops_struct_ops, gpu_storage_ops);
+	if (ret) {
+		pr_err("UVM: Failed to register gpu_storage_ops struct_ops: %d\n", ret);
 		return ret;
 	}
 
@@ -455,5 +574,20 @@ void uvm_bpf_call_gpu_evict_prepare(
 	if (ops && ops->gpu_evict_prepare) {
 		ops->gpu_evict_prepare(pmm, va_block_used, va_block_unused);
 	}
+	rcu_read_unlock();
+}
+
+/* GPU storage scheduling policy hook wrapper. The attached policy is always
+ * invoked when registered; there is no policy selector. The context carries
+ * all request inputs and receives the recorded decision. */
+void uvm_bpf_call_gpu_storage_decide(
+	uvm_bpf_storage_decision_ctx_t *decision)
+{
+	struct gpu_storage_ops *ops;
+
+	rcu_read_lock();
+	ops = rcu_dereference(uvm_storage_ops);
+	if (ops && ops->gpu_storage_decide)
+		ops->gpu_storage_decide(decision);
 	rcu_read_unlock();
 }
