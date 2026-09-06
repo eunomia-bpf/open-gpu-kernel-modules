@@ -267,5 +267,6 @@ NV_STATUS uvm_api_populate_pageable(const UVM_POPULATE_PAGEABLE_PARAMS *params, 
 NV_STATUS uvm_api_alloc_device_p2p(UVM_ALLOC_DEVICE_P2P_PARAMS *params, struct file *filp);
 NV_STATUS uvm_api_clear_all_access_counters(UVM_CLEAR_ALL_ACCESS_COUNTERS_PARAMS *params, struct file *filp);
 NV_STATUS uvm_api_query_residency(UVM_QUERY_RESIDENCY_PARAMS *params, struct file *filp);
+NV_STATUS uvm_api_gpu_storage_decide(UVM_GPU_STORAGE_DECIDE_PARAMS *params, struct file *filp);
 
 #endif // __UVM_API_H__

@@ -19,6 +19,51 @@ typedef struct uvm_bpf_pmm_decision_ctx
     nv_gpu_pmm_request_t request;
 } uvm_bpf_pmm_decision_ctx_t;
 
+/* Fixed-width storage scheduling request inputs passed to the BPF hook. */
+typedef struct uvm_bpf_storage_request
+{
+    NvU32 abi_version;
+    NvU32 op;
+    NvU32 request_flags;
+    NvU32 input_priority;
+    NvU64 request_id;
+    NvU64 object_id;
+    NvU64 bytes;
+    NvU64 tenant_id;
+    NvU64 caller_hint;
+    NvU64 deadline_ns;
+    NvU64 slack_ns;
+    NvU64 estimated_transfer_ns;
+    NvU64 recompute_ns;
+    NvU32 queue_depth;
+    NvU32 hbm_pressure_permille;
+} uvm_bpf_storage_request_t;
+
+/* Storage scheduling decision recorded by the BPF kfunc. All fields are
+ * clamped by the kfunc before being visible to the ioctl handler. */
+typedef struct uvm_bpf_storage_decision
+{
+    NvU32 action;
+    NvU64 defer_ns;
+    NvU32 priority;
+    NvU32 batch_target;
+} uvm_bpf_storage_decision_t;
+
+/* Callback-local context for the storage policy hook: all request inputs
+ * plus the decision recorded via bpf_gpu_storage_record(). */
+typedef struct uvm_bpf_storage_decision_ctx
+{
+    uvm_bpf_storage_request_t request;
+    uvm_bpf_storage_decision_t decision;
+    NvU32 recorded;
+} uvm_bpf_storage_decision_ctx_t;
+
+/* Storage decision clamps, shared by the kfunc and the ioctl handler */
+#define UVM_GPU_STORAGE_MAX_DEFER_NS     10000000ULL /* 10 ms */
+#define UVM_GPU_STORAGE_MAX_PRIORITY     7U
+#define UVM_GPU_STORAGE_MIN_BATCH_TARGET 1U
+#define UVM_GPU_STORAGE_MAX_BATCH_TARGET 64U
+
 /* Action codes returned by BPF hooks */
 enum uvm_bpf_action {
     UVM_BPF_ACTION_DEFAULT = 0,       /* Use default kernel behavior */
@@ -57,5 +102,11 @@ void uvm_bpf_call_gpu_evict_prepare(
     uvm_pmm_gpu_t *pmm,
     struct list_head *va_block_used,
     struct list_head *va_block_unused);
+
+/* GPU storage scheduling policy hook wrapper. The attached policy is always
+ * invoked when registered; there is no policy selector. The context carries
+ * all request inputs and receives the recorded decision. */
+void uvm_bpf_call_gpu_storage_decide(
+    uvm_bpf_storage_decision_ctx_t *decision);
 
 #endif /* _UVM_BPF_STRUCT_OPS_H */

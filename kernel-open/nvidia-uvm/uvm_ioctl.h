@@ -956,6 +956,63 @@ typedef struct
 } UVM_QUERY_RESIDENCY_PARAMS;
 
 //
+// UvmGpuStorageDecide
+//
+// Asks the kernel to decide how the caller's pending GPU storage transfer
+// should be scheduled. The caller supplies only fixed-width request inputs:
+// an ABI version, an op, request flags, a priority, request/object
+// identifiers, byte and deadline counts, and HBM pressure samples. The
+// kernel consults the attached gpu_storage_ops BPF program (if any) and
+// replies with an action plus clamped scheduling values, together with the
+// caller thread-group id. The interface never accepts or returns an fd,
+// file offset, GPU pointer, CUDA stream, or completion object.
+//
+#define UVM_GPU_STORAGE_ABI_VERSION                             1
+
+#define UVM_GPU_STORAGE_OP_READ                                 0
+#define UVM_GPU_STORAGE_OP_WRITE                                1
+
+#define UVM_GPU_STORAGE_REQUEST_FLAG_DEMAND                     0x00000001
+#define UVM_GPU_STORAGE_REQUEST_FLAG_SPECULATIVE                0x00000002
+#define UVM_GPU_STORAGE_REQUEST_FLAG_RECOMPUTABLE               0x00000004
+#define UVM_GPU_STORAGE_REQUEST_FLAG_SAFE_TO_DEFER              0x00000008
+#define UVM_GPU_STORAGE_REQUEST_FLAGS_ALL                       (UVM_GPU_STORAGE_REQUEST_FLAG_DEMAND | \
+                                                                 UVM_GPU_STORAGE_REQUEST_FLAG_SPECULATIVE | \
+                                                                 UVM_GPU_STORAGE_REQUEST_FLAG_RECOMPUTABLE | \
+                                                                 UVM_GPU_STORAGE_REQUEST_FLAG_SAFE_TO_DEFER)
+
+#define UVM_GPU_STORAGE_ACTION_SUBMIT_NOW                       0
+#define UVM_GPU_STORAGE_ACTION_DEFER                            1
+#define UVM_GPU_STORAGE_ACTION_RECOMPUTE                        2
+
+#define UVM_GPU_STORAGE_DECIDE                                  UVM_IOCTL_BASE(82)
+
+typedef struct
+{
+    NvU32     abiVersion;                             // IN
+    NvU32     op;                                     // IN (UVM_GPU_STORAGE_OP_*)
+    NvU32     requestFlags;                           // IN
+    NvU32     inputPriority;                          // IN
+    NvU64     requestId          NV_ALIGN_BYTES(8);   // IN
+    NvU64     objectId           NV_ALIGN_BYTES(8);   // IN
+    NvU64     bytes              NV_ALIGN_BYTES(8);   // IN
+    NvU64     tenantId           NV_ALIGN_BYTES(8);   // IN
+    NvU64     callerHint         NV_ALIGN_BYTES(8);   // IN
+    NvU64     deadlineNs         NV_ALIGN_BYTES(8);   // IN
+    NvU64     slackNs            NV_ALIGN_BYTES(8);   // IN
+    NvU64     estimatedTransferNs NV_ALIGN_BYTES(8);  // IN
+    NvU64     recomputeNs        NV_ALIGN_BYTES(8);   // IN
+    NvU32     queueDepth;                             // IN
+    NvU32     hbmPressurePermille;                    // IN
+    NvU32     action;                                 // OUT
+    NvU32     outputPriority;                         // OUT
+    NvU64     deferNs            NV_ALIGN_BYTES(8);   // OUT
+    NvU32     batchTarget;                            // OUT
+    NvU64     callerTgid         NV_ALIGN_BYTES(8);   // OUT
+    NV_STATUS rmStatus;                               // OUT
+} UVM_GPU_STORAGE_DECIDE_PARAMS;
+
+//
 // Temporary ioctls which should be removed before UVM 8 release
 // Number backwards from 2047 - highest custom ioctl function number
 // windows can handle.
