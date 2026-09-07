@@ -1070,6 +1070,77 @@ NV_STATUS uvm_api_gpu_storage_decide(UVM_GPU_STORAGE_DECIDE_PARAMS *params, stru
     return NV_OK;
 }
 
+static NV_STATUS uvm_api_kv_reclaim_choose(UVM_KV_RECLAIM_CHOOSE_PARAMS *params, struct file *filp)
+{
+    uvm_bpf_kv_reclaim_decision_ctx_t decision = {0};
+    NvU32 i;
+
+    params->selectedIndex = 0;
+    params->selectedRoute = UVM_KV_RECLAIM_ROUTE_STOCK;
+    params->selectedCookie = 0;
+    params->estimatedRecoveryNs = 0;
+
+    if (params->abiVersion != UVM_KV_RECLAIM_ABI_VERSION ||
+        params->nCandidates == 0 ||
+        params->nCandidates > UVM_KV_RECLAIM_MAX_CANDIDATES ||
+        params->stockIndex >= params->nCandidates ||
+        params->pad0 != 0) {
+        // Invalid requests fall back to the stock defaults, never BPF.
+        return NV_OK;
+    }
+
+    for (i = 0; i < params->nCandidates; i++) {
+        if (params->priority[i] > UVM_KV_RECLAIM_MAX_PRIORITY ||
+            (params->flags[i] & ~UVM_KV_RECLAIM_CANDIDATE_FLAGS_ALL)) {
+            // Invalid requests fall back to the stock defaults, never BPF.
+            return NV_OK;
+        }
+    }
+
+    decision.request.abi_version = params->abiVersion;
+    decision.request.n_candidates = params->nCandidates;
+    decision.request.stock_index = params->stockIndex;
+    decision.request.pad0 = params->pad0;
+    decision.request.disk_read_ns_per_kib = params->diskReadNsPerKib;
+    decision.request.recompute_ns_per_token = params->recomputeNsPerToken;
+    for (i = 0; i < UVM_KV_RECLAIM_MAX_CANDIDATES; i++) {
+        decision.candidates[i].cookie = params->cookie[i];
+        decision.candidates[i].freeable_bytes = params->freeableBytes[i];
+        decision.candidates[i].computed_tokens = params->computedTokens[i];
+        decision.candidates[i].disk_backed_tokens = params->diskBackedTokens[i];
+        decision.candidates[i].disk_backed_bytes = params->diskBackedBytes[i];
+        decision.candidates[i].priority = params->priority[i];
+        decision.candidates[i].flags = params->flags[i];
+    }
+
+    // The eligible mask is the kernel's trusted view of the worst-priority
+    // class restriction and telemetry sanity; the BPF kfunc enforces it.
+    decision.eligible_mask = 0;
+    for (i = 0; i < params->nCandidates; i++) {
+        if (uvm_kv_reclaim_eligible(&decision, params->nCandidates, i))
+            decision.eligible_mask |= (1u << i);
+    }
+
+    params->selectedIndex = params->stockIndex;
+    params->selectedCookie = params->cookie[params->stockIndex];
+
+    // The attached policy (if any) is always consulted.
+    uvm_bpf_call_gpu_kv_reclaim_choose(&decision);
+
+    // Missing policy, no registered program, or an unrecorded decision all
+    // keep the stock victim.
+    if (decision.recorded &&
+        decision.decision.index < params->nCandidates &&
+        (decision.eligible_mask & (1u << decision.decision.index))) {
+        params->selectedIndex = decision.decision.index;
+        params->selectedRoute = decision.decision.route;
+        params->selectedCookie = decision.decision.cookie;
+        params->estimatedRecoveryNs = decision.decision.estimated_ns;
+    }
+
+    return NV_OK;
+}
+
 static long uvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 {
     switch (cmd)
@@ -1080,6 +1151,7 @@ static long uvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
         UVM_ROUTE_CMD_STACK_NO_INIT_CHECK(UVM_INITIALIZE,                  uvm_api_initialize);
         UVM_ROUTE_CMD_STACK_NO_INIT_CHECK(UVM_MM_INITIALIZE,               uvm_api_mm_initialize);
         UVM_ROUTE_CMD_STACK_NO_INIT_CHECK(UVM_GPU_STORAGE_DECIDE,          uvm_api_gpu_storage_decide);
+        UVM_ROUTE_CMD_ALLOC_NO_INIT_CHECK(UVM_KV_RECLAIM_CHOOSE,           uvm_api_kv_reclaim_choose);
 
         UVM_ROUTE_CMD_STACK_INIT_CHECK(UVM_PAGEABLE_MEM_ACCESS,            uvm_api_pageable_mem_access);
         UVM_ROUTE_CMD_STACK_INIT_CHECK(UVM_PAGEABLE_MEM_ACCESS_ON_GPU,     uvm_api_pageable_mem_access_on_gpu);

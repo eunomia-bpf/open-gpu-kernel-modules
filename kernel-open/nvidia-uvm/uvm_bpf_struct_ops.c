@@ -78,11 +78,23 @@ struct gpu_storage_ops {
 		uvm_bpf_storage_decision_ctx_t *decision_ctx);
 };
 
+/* Shared struct_ops definition between kernel module and BPF program.
+ * The KV reclaim policy hook takes the callback-local context carrying the
+ * bounded candidate vector and shared rates; the BPF program records its
+ * selected victim with bpf_kv_reclaim_record(). The kernel handler never
+ * sees or stores an fd, file offset, GPU pointer, CUDA stream, or
+ * completion, and keeps no caller state. */
+struct gpu_kv_reclaim_ops {
+	int (*gpu_kv_reclaim_choose)(
+		uvm_bpf_kv_reclaim_decision_ctx_t *decision_ctx);
+};
+
 
 /* Define our custom struct_ops operations */
 /* Global instance that BPF programs will implement */
 static struct gpu_mem_ops __rcu *uvm_ops;
 static struct gpu_storage_ops __rcu *uvm_storage_ops;
+static struct gpu_kv_reclaim_ops __rcu *uvm_kv_reclaim_ops;
 
 /* Proc file to trigger the struct_ops */
 static struct proc_dir_entry *trigger_file;
@@ -148,6 +160,12 @@ static int gpu_storage_ops__gpu_storage_decide(
 	return 0;
 }
 
+static int gpu_kv_reclaim_ops__gpu_kv_reclaim_choose(
+	uvm_bpf_kv_reclaim_decision_ctx_t *decision_ctx)
+{
+	return 0;
+}
+
 /* CFI stubs structure */
 static struct gpu_mem_ops __bpf_ops_gpu_mem_ops = {
 	.gpu_test_trigger = gpu_mem_ops__gpu_test_trigger,
@@ -161,6 +179,10 @@ static struct gpu_mem_ops __bpf_ops_gpu_mem_ops = {
 
 static struct gpu_storage_ops __bpf_ops_gpu_storage_ops = {
 	.gpu_storage_decide = gpu_storage_ops__gpu_storage_decide,
+};
+
+static struct gpu_kv_reclaim_ops __bpf_ops_gpu_kv_reclaim_ops = {
+	.gpu_kv_reclaim_choose = gpu_kv_reclaim_ops__gpu_kv_reclaim_choose,
 };
 
 /* Begin kfunc definitions */
@@ -260,6 +282,50 @@ __bpf_kfunc int bpf_gpu_storage_record(uvm_bpf_storage_decision_ctx_t *decision_
 	return 0;
 }
 
+/* Record the KV reclaim victim chosen by the BPF program. This kfunc is
+ * mechanism-only: it validates the selected index against the precomputed
+ * eligible mask (worst priority class, positive freeable bytes, consistent
+ * telemetry), echoes the candidate's cookie back, checks the route range,
+ * and clamps the saturating estimate. It does NOT enforce any particular
+ * cost algorithm, so different matched native/BPF policies are permitted.
+ * Anything out of range leaves recorded at 0 so the ioctl handler keeps the
+ * caller's stock victim. */
+__bpf_kfunc int bpf_kv_reclaim_record(uvm_bpf_kv_reclaim_decision_ctx_t *decision_ctx,
+				      u32 index,
+				      u32 route,
+				      u64 cookie,
+				      u64 estimated_ns)
+{
+	NvU32 n;
+
+	if (!decision_ctx)
+		return NV_GPU_TRANSITION_REJECT_IDENTITY;
+
+	n = decision_ctx->request.n_candidates;
+	if (index >= n || index >= UVM_KV_RECLAIM_MAX_CANDIDATES)
+		return NV_GPU_TRANSITION_REJECT_IDENTITY;
+
+	if (!(decision_ctx->eligible_mask & (1u << index)))
+		return NV_GPU_TRANSITION_REJECT_IDENTITY;
+
+	if (cookie != decision_ctx->candidates[index].cookie)
+		return NV_GPU_TRANSITION_REJECT_IDENTITY;
+
+	if (route != UVM_KV_RECLAIM_ROUTE_FULL_RECOMPUTE &&
+	    route != UVM_KV_RECLAIM_ROUTE_DISK_PREFIX)
+		return NV_GPU_TRANSITION_REJECT_IDENTITY;
+
+	decision_ctx->decision.index = index;
+	decision_ctx->decision.route = route;
+	decision_ctx->decision.cookie = cookie;
+	decision_ctx->decision.estimated_ns =
+		(estimated_ns <= UVM_KV_RECLAIM_COST_SAT) ?
+		estimated_ns : UVM_KV_RECLAIM_COST_SAT;
+	decision_ctx->recorded = 1;
+
+	return 0;
+}
+
 /* End kfunc definitions */
 __bpf_kfunc_end_defs();
 
@@ -275,6 +341,7 @@ BTF_ID_FLAGS(func, bpf_gpu_set_prefetch_region, KF_TRUSTED_ARGS)
 BTF_ID_FLAGS(func, bpf_gpu_request_reorder, KF_TRUSTED_ARGS)
 BTF_ID_FLAGS(func, bpf_gpu_storage_record, KF_TRUSTED_ARGS)
 BTF_ID_FLAGS(func, bpf_gpu_stale_state_v1_request, KF_TRUSTED_ARGS)
+BTF_ID_FLAGS(func, bpf_kv_reclaim_record, KF_TRUSTED_ARGS)
 BTF_KFUNCS_END(uvm_bpf_struct_ops_kfunc_ids_set)
 
 BTF_KFUNCS_START(uvm_bpf_kprobe_kfunc_ids_set)
@@ -282,6 +349,7 @@ BTF_ID_FLAGS(func, bpf_gpu_strstr)
 BTF_ID_FLAGS(func, bpf_gpu_set_prefetch_region, KF_TRUSTED_ARGS)
 BTF_ID_FLAGS(func, bpf_gpu_request_reorder, KF_TRUSTED_ARGS)
 BTF_ID_FLAGS(func, bpf_gpu_storage_record, KF_TRUSTED_ARGS)
+BTF_ID_FLAGS(func, bpf_kv_reclaim_record, KF_TRUSTED_ARGS)
 BTF_KFUNCS_END(uvm_bpf_kprobe_kfunc_ids_set)
 
 static const struct btf_kfunc_id_set uvm_bpf_struct_ops_kfunc_set = {
@@ -391,6 +459,30 @@ static void gpu_storage_ops_unreg(void *kdata, struct bpf_link *link)
 	pr_info("gpu_storage_ops unregistered from nvidia-uvm\n");
 }
 
+static int gpu_kv_reclaim_ops_reg(void *kdata, struct bpf_link *link)
+{
+	struct gpu_kv_reclaim_ops *ops = kdata;
+
+	/* Only one instance at a time */
+	if (cmpxchg(&uvm_kv_reclaim_ops, NULL, ops) != NULL)
+		return -EEXIST;
+
+	pr_info("gpu_kv_reclaim_ops registered in nvidia-uvm\n");
+	return 0;
+}
+
+static void gpu_kv_reclaim_ops_unreg(void *kdata, struct bpf_link *link)
+{
+	struct gpu_kv_reclaim_ops *ops = kdata;
+
+	if (cmpxchg(&uvm_kv_reclaim_ops, ops, NULL) != ops) {
+		pr_warn("gpu_kv_reclaim_ops: unexpected unreg in nvidia-uvm\n");
+		return;
+	}
+
+	pr_info("gpu_kv_reclaim_ops unregistered from nvidia-uvm\n");
+}
+
 /* Struct ops definition */
 static struct bpf_struct_ops gpu_mem_ops_struct_ops = {
 	.verifier_ops = &gpu_mem_ops_verifier_ops,
@@ -411,6 +503,17 @@ static struct bpf_struct_ops gpu_storage_ops_struct_ops = {
 	.unreg = gpu_storage_ops_unreg,
 	.cfi_stubs = &__bpf_ops_gpu_storage_ops,
 	.name = "gpu_storage_ops",
+	.owner = THIS_MODULE,
+};
+
+static struct bpf_struct_ops gpu_kv_reclaim_ops_struct_ops = {
+	.verifier_ops = &gpu_mem_ops_verifier_ops,
+	.init = gpu_mem_ops_init,
+	.init_member = gpu_mem_ops_init_member,
+	.reg = gpu_kv_reclaim_ops_reg,
+	.unreg = gpu_kv_reclaim_ops_unreg,
+	.cfi_stubs = &__bpf_ops_gpu_kv_reclaim_ops,
+	.name = "gpu_kv_reclaim_ops",
 	.owner = THIS_MODULE,
 };
 
@@ -494,6 +597,13 @@ int uvm_bpf_struct_ops_init(void)
 	ret = register_bpf_struct_ops(&gpu_storage_ops_struct_ops, gpu_storage_ops);
 	if (ret) {
 		pr_err("UVM: Failed to register gpu_storage_ops struct_ops: %d\n", ret);
+		goto error_proc;
+	}
+
+	/* Register the KV reclaim candidate-selection policy struct_ops */
+	ret = register_bpf_struct_ops(&gpu_kv_reclaim_ops_struct_ops, gpu_kv_reclaim_ops);
+	if (ret) {
+		pr_err("UVM: Failed to register gpu_kv_reclaim_ops struct_ops: %d\n", ret);
 		goto error_proc;
 	}
 
@@ -659,5 +769,21 @@ void uvm_bpf_call_gpu_storage_decide(
 	ops = rcu_dereference(uvm_storage_ops);
 	if (ops && ops->gpu_storage_decide)
 		ops->gpu_storage_decide(decision);
+	rcu_read_unlock();
+}
+
+/* KV reclaim candidate-selection policy hook wrapper. The attached policy
+ * is always invoked when registered; there is no policy selector. The
+ * context carries the bounded candidate vector, shared rates, and the
+ * precomputed eligible mask, and receives the recorded decision. */
+void uvm_bpf_call_gpu_kv_reclaim_choose(
+	uvm_bpf_kv_reclaim_decision_ctx_t *decision)
+{
+	struct gpu_kv_reclaim_ops *ops;
+
+	rcu_read_lock();
+	ops = rcu_dereference(uvm_kv_reclaim_ops);
+	if (ops && ops->gpu_kv_reclaim_choose)
+		ops->gpu_kv_reclaim_choose(decision);
 	rcu_read_unlock();
 }

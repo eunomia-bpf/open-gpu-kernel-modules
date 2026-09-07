@@ -1179,6 +1179,65 @@ typedef struct
 } UVM_GPU_STORAGE_DECIDE_PARAMS;
 
 //
+// UvmKvReclaimChoose
+//
+// Asks the kernel to pick a KV reclaim victim from a bounded vector of up to
+// UVM_KV_RECLAIM_MAX_CANDIDATES candidate requests. The caller supplies only
+// fixed-width scalar metadata per candidate: an opaque cookie, the actually
+// freeable KV bytes, the computed token count, the contiguous disk-backed
+// prefix token/byte counts (the byte count is the provider's actual backed
+// transfer bytes), a 0..UVM_KV_RECLAIM_MAX_PRIORITY priority using vLLM
+// integer semantics (lower value is more important, so the worst class is
+// the maximum value), and coverage flags - plus shared observed disk-read
+// ns/KiB and recompute ns/token rates and the caller's own default (stock)
+// victim index. The kernel consults the attached gpu_kv_reclaim_ops BPF
+// program (if any) and replies with the selected index/cookie/route and a
+// saturating estimated recovery cost. The interface never accepts or
+// returns an fd, file offset, GPU pointer, arbitrary user pointer, CUDA
+// stream, or completion object, and the kernel keeps no caller state. The
+// kernel validates only index range, the precomputed eligible mask (worst
+// priority class, positive freeable bytes, consistent telemetry), the
+// echoed cookie, and the route range; a missing policy, an unrecorded
+// decision, ties, unknown or unusable telemetry, or zero freeable
+// candidates all keep the caller's stock victim.
+//
+#define UVM_KV_RECLAIM_ABI_VERSION                            1
+#define UVM_KV_RECLAIM_MAX_CANDIDATES                         8
+#define UVM_KV_RECLAIM_MAX_PRIORITY                           7U
+
+#define UVM_KV_RECLAIM_CANDIDATE_FLAG_COVERAGE_KNOWN          0x00000001
+#define UVM_KV_RECLAIM_CANDIDATE_FLAGS_ALL                    \
+    UVM_KV_RECLAIM_CANDIDATE_FLAG_COVERAGE_KNOWN
+
+#define UVM_KV_RECLAIM_ROUTE_STOCK                            0
+#define UVM_KV_RECLAIM_ROUTE_FULL_RECOMPUTE                   1
+#define UVM_KV_RECLAIM_ROUTE_DISK_PREFIX                      2
+
+#define UVM_KV_RECLAIM_CHOOSE                                 UVM_IOCTL_BASE(83)
+
+typedef struct
+{
+    NvU32     abiVersion;                                       // IN
+    NvU32     nCandidates;                                      // IN 1..UVM_KV_RECLAIM_MAX_CANDIDATES
+    NvU32     stockIndex;                                       // IN caller's default victim index
+    NvU32     pad0;                                             // IN reserved, must be 0
+    NvU64     diskReadNsPerKib        NV_ALIGN_BYTES(8);        // IN shared observed, 0 = unknown
+    NvU64     recomputeNsPerToken     NV_ALIGN_BYTES(8);        // IN shared observed, 0 = unknown
+    NvU64     cookie[UVM_KV_RECLAIM_MAX_CANDIDATES] NV_ALIGN_BYTES(8);
+    NvU64     freeableBytes[UVM_KV_RECLAIM_MAX_CANDIDATES] NV_ALIGN_BYTES(8);
+    NvU64     computedTokens[UVM_KV_RECLAIM_MAX_CANDIDATES] NV_ALIGN_BYTES(8);
+    NvU64     diskBackedTokens[UVM_KV_RECLAIM_MAX_CANDIDATES] NV_ALIGN_BYTES(8);
+    NvU64     diskBackedBytes[UVM_KV_RECLAIM_MAX_CANDIDATES] NV_ALIGN_BYTES(8);
+    NvU32     priority[UVM_KV_RECLAIM_MAX_CANDIDATES];          // IN 0..UVM_KV_RECLAIM_MAX_PRIORITY
+    NvU32     flags[UVM_KV_RECLAIM_MAX_CANDIDATES];            // IN UVM_KV_RECLAIM_CANDIDATE_FLAG_*
+    NvU32     selectedIndex;                                    // OUT
+    NvU32     selectedRoute;                                   // OUT UVM_KV_RECLAIM_ROUTE_*
+    NvU64     selectedCookie              NV_ALIGN_BYTES(8);   // OUT
+    NvU64     estimatedRecoveryNs         NV_ALIGN_BYTES(8);   // OUT saturating
+    NV_STATUS rmStatus;                                        // OUT
+} UVM_KV_RECLAIM_CHOOSE_PARAMS;
+
+//
 // Temporary ioctls which should be removed before UVM 8 release
 // Number backwards from 2047 - highest custom ioctl function number
 // windows can handle.

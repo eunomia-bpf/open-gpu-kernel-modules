@@ -1,6 +1,7 @@
 #ifndef _UVM_BPF_STRUCT_OPS_H
 #define _UVM_BPF_STRUCT_OPS_H
 
+#include "uvm_ioctl.h"
 #include "uvm_va_block_types.h"
 #include "uvm_perf_prefetch.h"
 #include "uvm_pmm_gpu.h"
@@ -140,5 +141,103 @@ void uvm_bpf_call_gpu_evict_prepare(
  * all request inputs and receives the recorded decision. */
 void uvm_bpf_call_gpu_storage_decide(
     uvm_bpf_storage_decision_ctx_t *decision);
+
+/* Fixed-width KV reclaim candidate vector and callback-local context.
+ * Mirrors gds-control/kv_reclaim_abi.h. The kernel keeps no caller state:
+ * every call carries its own bounded candidate vector (max 8, fixed-width
+ * scalars only) plus shared observed rates. No fd, file offset, GPU
+ * pointer, arbitrary user pointer, stream, or completion crosses this
+ * interface. Priority uses vLLM integer semantics: lower value is more
+ * important, so the worst class is the maximum value. */
+#define UVM_KV_RECLAIM_COST_SAT 0x7FFFFFFFFFFFFFFFULL /* saturating estimate cap */
+
+typedef struct uvm_bpf_kv_reclaim_candidate
+{
+    NvU64 cookie;             // opaque caller token, echoed back only
+    NvU64 freeable_bytes;     // KV bytes actually freeable by reclaim
+    NvU64 computed_tokens;    // tokens computed so far
+    NvU64 disk_backed_tokens; // contiguous disk-backed prefix tokens
+    NvU64 disk_backed_bytes;  // provider's actual backed transfer bytes
+    NvU32 priority;           // 0..UVM_KV_RECLAIM_MAX_PRIORITY, lower is more important
+    NvU32 flags;             // UVM_KV_RECLAIM_CANDIDATE_FLAG_*
+} uvm_bpf_kv_reclaim_candidate_t;
+
+typedef struct uvm_bpf_kv_reclaim_request
+{
+    NvU32 abi_version;
+    NvU32 n_candidates;       // 1..UVM_KV_RECLAIM_MAX_CANDIDATES
+    NvU32 stock_index;        // caller's default victim index
+    NvU32 pad0;               // reserved, must be 0
+    NvU64 disk_read_ns_per_kib;   // shared observed rate, 0 = unknown
+    NvU64 recompute_ns_per_token; // shared observed rate, 0 = unknown
+} uvm_bpf_kv_reclaim_request_t;
+
+/* KV reclaim decision recorded by the BPF kfunc. All fields are validated
+ * by the kfunc (index/cookie/eligible class/route range) before being
+ * visible to the ioctl handler; the estimate is clamped to the cap. */
+typedef struct uvm_bpf_kv_reclaim_decision
+{
+    NvU32 index;              // selected candidate index
+    NvU32 route;              // UVM_KV_RECLAIM_ROUTE_*
+    NvU64 cookie;
+    NvU64 estimated_ns;       // saturating estimated recovery cost
+} uvm_bpf_kv_reclaim_decision_t;
+
+/* Callback-local context for the KV reclaim policy hook: all inputs plus
+ * the decision recorded via bpf_kv_reclaim_record(). eligible_mask is
+ * precomputed by the ioctl handler and is the kernel-trusted view of
+ * eligibility. */
+typedef struct uvm_bpf_kv_reclaim_decision_ctx
+{
+    uvm_bpf_kv_reclaim_request_t request;
+    uvm_bpf_kv_reclaim_candidate_t candidates[UVM_KV_RECLAIM_MAX_CANDIDATES];
+    uvm_bpf_kv_reclaim_decision_t decision;
+    NvU32 eligible_mask;
+    NvU32 recorded;
+} uvm_bpf_kv_reclaim_decision_ctx_t;
+
+/* Worst (least important) priority class among candidates with positive
+ * freeable bytes, in vLLM integer semantics: lower value is more important,
+ * so the worst class is the MAXIMUM priority value. Returns 0 when none. */
+static inline NvU32 uvm_kv_reclaim_worst_class(
+    const uvm_bpf_kv_reclaim_decision_ctx_t *ctx, NvU32 n)
+{
+    NvU32 i, worst = 0, any = 0;
+
+    for (i = 0; i < n; i++) {
+        if (ctx->candidates[i].freeable_bytes == 0)
+            continue;
+        if (!any || ctx->candidates[i].priority > worst) {
+            worst = ctx->candidates[i].priority;
+            any = 1;
+        }
+    }
+    return any ? worst : 0;
+}
+
+/* Eligible: positive freeable bytes, usable recompute rate, consistent
+ * telemetry (disk_backed_tokens <= computed_tokens), and the worst
+ * priority class. */
+static inline NvU32 uvm_kv_reclaim_eligible(
+    const uvm_bpf_kv_reclaim_decision_ctx_t *ctx, NvU32 n, NvU32 i)
+{
+    const uvm_bpf_kv_reclaim_candidate_t *c = &ctx->candidates[i];
+
+    if (i >= n || c->freeable_bytes == 0)
+        return 0;
+    if (ctx->request.recompute_ns_per_token == 0)
+        return 0;
+    if (c->disk_backed_tokens > c->computed_tokens)
+        return 0;
+    if (c->priority != uvm_kv_reclaim_worst_class(ctx, n))
+        return 0;
+    return 1;
+}
+
+/* KV reclaim candidate-selection policy hook wrapper. The attached policy
+ * is always invoked when registered; there is no policy selector. The
+ * context carries all candidate inputs and receives the recorded decision. */
+void uvm_bpf_call_gpu_kv_reclaim_choose(
+    uvm_bpf_kv_reclaim_decision_ctx_t *decision);
 
 #endif /* _UVM_BPF_STRUCT_OPS_H */
