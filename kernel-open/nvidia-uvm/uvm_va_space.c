@@ -232,6 +232,7 @@ NV_STATUS uvm_va_space_create(struct address_space *mapping, uvm_va_space_t **va
     init_waitqueue_head(&va_space->gpu_va_space_deferred_free.wait_queue);
 
     va_space->mapping = mapping;
+    va_space->stale_state_owner_tgid = uvm_get_stale_process_id();
     va_space->test.page_prefetch_enabled = true;
 
     init_tools_data(va_space);

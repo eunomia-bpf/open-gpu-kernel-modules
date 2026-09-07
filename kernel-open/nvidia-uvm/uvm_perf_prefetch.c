@@ -102,7 +102,8 @@ NvU16 uvm_perf_prefetch_bitmap_tree_iter_get_count(const uvm_perf_prefetch_bitma
 
 static uvm_va_block_region_t compute_prefetch_region(uvm_page_index_t page_index,
                                                      uvm_perf_prefetch_bitmap_tree_t *bitmap_tree,
-                                                     uvm_va_block_region_t max_prefetch_region)
+                                                     uvm_va_block_region_t max_prefetch_region,
+                                                     NvU32 owner_tgid)
 {
     NvU16 counter;
     uvm_perf_prefetch_bitmap_tree_iter_t iter;
@@ -113,12 +114,24 @@ static uvm_va_block_region_t compute_prefetch_region(uvm_page_index_t page_index
     enum nv_gpu_prefetch_initial_effect initial_effect;
     NvS64 raw_action;
     struct uvm_bpf_prefetch_diagnostic_ctx diagnostic = {0};
+    uvm_stale_state_v1_decision_ctx_t stale_decision_ctx = {0};
+    struct uvm_stale_state_v1_diagnostic stale_diagnostic = {0};
+    bool stale_state_active;
     const NvU64 type_outer = (NvU64)(uvm_page_index_t)~0U;
 
-    raw_action = uvm_bpf_call_gpu_page_prefetch(page_index,
-                                                bitmap_tree,
-                                                &max_prefetch_region,
-                                                &initial_decision);
+    stale_state_active =
+        uvm_stale_state_v1_begin(page_index,
+                                 &max_prefetch_region,
+                                 owner_tgid,
+                                 &stale_decision_ctx,
+                                 &stale_diagnostic,
+                                 &raw_action,
+                                 &initial_decision);
+    if (!stale_state_active)
+        raw_action = uvm_bpf_call_gpu_page_prefetch(page_index,
+                                                    bitmap_tree,
+                                                    &max_prefetch_region,
+                                                    &initial_decision);
     region_result = nv_gpu_transition_validate_region(&initial_decision,
                                                        max_prefetch_region.first,
                                                        max_prefetch_region.outer,
@@ -127,6 +140,10 @@ static uvm_va_block_region_t compute_prefetch_region(uvm_page_index_t page_index
                                                        &validated_region);
     initial_effect = nv_gpu_transition_prefetch_initial_effect(raw_action,
                                                                region_result);
+    if (stale_state_active)
+        uvm_stale_state_v1_selected(&stale_diagnostic,
+                                    region_result,
+                                    initial_effect);
 
     diagnostic.raw_action = raw_action;
     diagnostic.requested_first = initial_decision.first;
@@ -230,6 +247,8 @@ static uvm_va_block_region_t compute_prefetch_region(uvm_page_index_t page_index
     diagnostic.output_outer = prefetch_region.outer;
     diagnostic.phase = UVM_BPF_PREFETCH_DIAG_FINISHED;
     uvm_bpf_prefetch_diagnostic(&diagnostic);
+    if (stale_state_active)
+        uvm_stale_state_v1_finished(&stale_diagnostic, &prefetch_region);
 
     return prefetch_region;
 }
@@ -389,6 +408,7 @@ static void compute_prefetch_mask(uvm_va_block_region_t faulted_region,
                                   uvm_va_block_region_t max_prefetch_region,
                                   uvm_perf_prefetch_bitmap_tree_t *bitmap_tree,
                                   const uvm_page_mask_t *faulted_pages,
+                                  NvU32 owner_tgid,
                                   uvm_page_mask_t *out_prefetch_mask)
 {
     uvm_page_index_t page_index;
@@ -397,7 +417,10 @@ static void compute_prefetch_mask(uvm_va_block_region_t faulted_region,
 
     // Update the tree using the faulted mask to compute the pages to prefetch.
     for_each_va_block_page_in_region_mask(page_index, faulted_pages, faulted_region) {
-        uvm_va_block_region_t region = compute_prefetch_region(page_index, bitmap_tree, max_prefetch_region);
+        uvm_va_block_region_t region = compute_prefetch_region(page_index,
+                                                               bitmap_tree,
+                                                               max_prefetch_region,
+                                                               owner_tgid);
 
         uvm_page_mask_region_fill(out_prefetch_mask, region);
 
@@ -473,6 +496,7 @@ static NvU32 uvm_perf_prefetch_prenotify_fault_migrations(uvm_va_block_t *va_blo
                               max_prefetch_region,
                               bitmap_tree,
                               &va_block_context->scratch_page_mask,
+                              uvm_va_block_get_va_space(va_block)->stale_state_owner_tgid,
                               prefetch_pages);
     }
 
@@ -530,7 +554,12 @@ void uvm_perf_prefetch_compute_ats(uvm_va_space_t *va_space,
 
     init_bitmap_tree_from_region(bitmap_tree, max_prefetch_region, residency_mask, faulted_pages);
 
-    compute_prefetch_mask(faulted_region, max_prefetch_region, bitmap_tree, faulted_pages, out_prefetch_mask);
+    compute_prefetch_mask(faulted_region,
+                          max_prefetch_region,
+                          bitmap_tree,
+                          faulted_pages,
+                          va_space->stale_state_owner_tgid,
+                          out_prefetch_mask);
 }
 
 void uvm_perf_prefetch_get_hint_va_block(uvm_va_block_t *va_block,

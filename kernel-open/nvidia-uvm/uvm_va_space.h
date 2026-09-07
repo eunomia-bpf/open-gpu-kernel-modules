@@ -388,6 +388,10 @@ struct uvm_va_space_struct
 
     NvU64 initialization_flags;
 
+    // Stable creator identity for address-free diagnostic ownership. Unlike
+    // current, this remains the workload TGID on GPU fault worker paths.
+    NvU32 stale_state_owner_tgid;
+
     // The mm currently associated with this VA space, if any.
     uvm_va_space_mm_t va_space_mm;
 

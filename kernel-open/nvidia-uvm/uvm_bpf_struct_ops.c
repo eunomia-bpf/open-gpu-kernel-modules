@@ -57,7 +57,15 @@ struct gpu_mem_ops {
 		uvm_pmm_gpu_t *pmm,
 		struct list_head *va_block_used,
 		struct list_head *va_block_unused);
+
+	/* Versioned, read-only stale-state decision hook. */
+	int (*gpu_stale_state_prefetch_v1)(
+		uvm_stale_state_v1_decision_ctx_t *decision_ctx);
 };
+
+static_assert(offsetof(struct gpu_mem_ops, gpu_stale_state_prefetch_v1) ==
+	      6 * sizeof(void *));
+static_assert(sizeof(struct gpu_mem_ops) == 7 * sizeof(void *));
 
 
 /* Shared struct_ops definition between kernel module and BPF program.
@@ -128,6 +136,12 @@ static int gpu_mem_ops__gpu_evict_prepare(
 	return UVM_BPF_ACTION_DEFAULT;
 }
 
+static int gpu_mem_ops__gpu_stale_state_prefetch_v1(
+	uvm_stale_state_v1_decision_ctx_t *decision_ctx)
+{
+	return NV_GPU_STALE_STATE_V1_ACTION_REJECT;
+}
+
 static int gpu_storage_ops__gpu_storage_decide(
 	uvm_bpf_storage_decision_ctx_t *decision_ctx)
 {
@@ -142,6 +156,7 @@ static struct gpu_mem_ops __bpf_ops_gpu_mem_ops = {
 	.gpu_block_activate = gpu_mem_ops__gpu_block_activate,
 	.gpu_block_access = gpu_mem_ops__gpu_block_access,
 	.gpu_evict_prepare = gpu_mem_ops__gpu_evict_prepare,
+	.gpu_stale_state_prefetch_v1 = gpu_mem_ops__gpu_stale_state_prefetch_v1,
 };
 
 static struct gpu_storage_ops __bpf_ops_gpu_storage_ops = {
@@ -182,6 +197,14 @@ __bpf_kfunc int bpf_gpu_request_reorder(uvm_bpf_pmm_decision_ctx_t *decision_ctx
 	return nv_gpu_transition_record_pmm(&decision_ctx->request,
 					    destination,
 					    position);
+}
+
+/* Submit one action while keeping the versioned context driver-owned. */
+__bpf_kfunc int bpf_gpu_stale_state_v1_request(
+	uvm_stale_state_v1_decision_ctx_t *decision_ctx,
+	u32 action)
+{
+	return uvm_stale_state_v1_record_bpf_action(decision_ctx, action);
 }
 
 /* Record the storage scheduling decision chosen by the BPF program.
@@ -241,17 +264,34 @@ __bpf_kfunc int bpf_gpu_storage_record(uvm_bpf_storage_decision_ctx_t *decision_
 __bpf_kfunc_end_defs();
 
 /* Define the BTF kfuncs ID set */
-BTF_KFUNCS_START(uvm_bpf_kfunc_ids_set)
+/*
+ * A module may register only one kfunc set per hook. Keep the mutating
+ * stale-state request API out of the KPROBE hook: only gpu_mem_ops callbacks
+ * receive a trusted decision context that is valid for this setter.
+ */
+BTF_KFUNCS_START(uvm_bpf_struct_ops_kfunc_ids_set)
 BTF_ID_FLAGS(func, bpf_gpu_strstr)
 BTF_ID_FLAGS(func, bpf_gpu_set_prefetch_region, KF_TRUSTED_ARGS)
 BTF_ID_FLAGS(func, bpf_gpu_request_reorder, KF_TRUSTED_ARGS)
 BTF_ID_FLAGS(func, bpf_gpu_storage_record, KF_TRUSTED_ARGS)
-BTF_KFUNCS_END(uvm_bpf_kfunc_ids_set)
+BTF_ID_FLAGS(func, bpf_gpu_stale_state_v1_request, KF_TRUSTED_ARGS)
+BTF_KFUNCS_END(uvm_bpf_struct_ops_kfunc_ids_set)
 
-/* Register the kfunc ID set */
-static const struct btf_kfunc_id_set uvm_bpf_kfunc_set = {
+BTF_KFUNCS_START(uvm_bpf_kprobe_kfunc_ids_set)
+BTF_ID_FLAGS(func, bpf_gpu_strstr)
+BTF_ID_FLAGS(func, bpf_gpu_set_prefetch_region, KF_TRUSTED_ARGS)
+BTF_ID_FLAGS(func, bpf_gpu_request_reorder, KF_TRUSTED_ARGS)
+BTF_ID_FLAGS(func, bpf_gpu_storage_record, KF_TRUSTED_ARGS)
+BTF_KFUNCS_END(uvm_bpf_kprobe_kfunc_ids_set)
+
+static const struct btf_kfunc_id_set uvm_bpf_struct_ops_kfunc_set = {
 	.owner = THIS_MODULE,
-	.set = &uvm_bpf_kfunc_ids_set,
+	.set = &uvm_bpf_struct_ops_kfunc_ids_set,
+};
+
+static const struct btf_kfunc_id_set uvm_bpf_kprobe_kfunc_set = {
+	.owner = THIS_MODULE,
+	.set = &uvm_bpf_kprobe_kfunc_ids_set,
 };
 
 /* BTF and verifier callbacks */
@@ -415,16 +455,29 @@ int uvm_bpf_struct_ops_init(void)
 {
 	int ret;
 
+	/* Make all fallible proc setup complete before publishing struct_ops. */
+	ret = uvm_stale_state_v1_init();
+	if (ret)
+		return ret;
+
+	trigger_file = proc_create("bpf_testmod_trigger", 0222, NULL, &trigger_proc_ops);
+	if (!trigger_file) {
+		ret = -ENOMEM;
+		goto error_stale_state;
+	}
+
 	/* Register the kfunc ID set for struct_ops programs */
-	ret = register_btf_kfunc_id_set(BPF_PROG_TYPE_STRUCT_OPS, &uvm_bpf_kfunc_set);
+	ret = register_btf_kfunc_id_set(BPF_PROG_TYPE_STRUCT_OPS,
+				       &uvm_bpf_struct_ops_kfunc_set);
 	if (ret) {
 		pr_err("UVM: Failed to register BTF kfunc ID set: %d\n", ret);
-		return ret;
+		goto error_proc;
 	}
 	pr_info("UVM: kfunc ID set registered successfully\n");
 
 	/* Also register for tracing programs (kprobe/uprobe) so they can call gpu kfuncs */
-	ret = register_btf_kfunc_id_set(BPF_PROG_TYPE_KPROBE, &uvm_bpf_kfunc_set);
+	ret = register_btf_kfunc_id_set(BPF_PROG_TYPE_KPROBE,
+				       &uvm_bpf_kprobe_kfunc_set);
 	if (ret) {
 		pr_warn("UVM: Failed to register kfunc for kprobe progs: %d (non-fatal)\n", ret);
 		/* Non-fatal: struct_ops still works */
@@ -434,27 +487,30 @@ int uvm_bpf_struct_ops_init(void)
 	ret = register_bpf_struct_ops(&gpu_mem_ops_struct_ops, gpu_mem_ops);
 	if (ret) {
 		pr_err("UVM: Failed to register struct_ops: %d\n", ret);
-		return ret;
+		goto error_proc;
 	}
 
 	/* Register the storage policy struct_ops */
 	ret = register_bpf_struct_ops(&gpu_storage_ops_struct_ops, gpu_storage_ops);
 	if (ret) {
 		pr_err("UVM: Failed to register gpu_storage_ops struct_ops: %d\n", ret);
-		return ret;
+		goto error_proc;
 	}
-
-	/* Create proc file for triggering */
-	trigger_file = proc_create("bpf_testmod_trigger", 0222, NULL, &trigger_proc_ops);
-	if (!trigger_file)
-		return -ENOMEM;
 
 	pr_info("UVM: bpf_struct_ops initialized\n");
 	return 0;
+
+error_proc:
+	proc_remove(trigger_file);
+	trigger_file = NULL;
+error_stale_state:
+	uvm_stale_state_v1_exit();
+	return ret;
 }
 
 void uvm_bpf_struct_ops_exit(void)
 {
+	uvm_stale_state_v1_exit();
 	if (trigger_file)
 		proc_remove(trigger_file);
 	/* Note: struct_ops unregister happens automatically on module unload */
@@ -514,6 +570,20 @@ NvS64 uvm_bpf_call_gpu_page_prefetch_iter(
 
 	*decision = decision_ctx.request;
 	return (NvS64)ret;
+}
+
+NvS64 uvm_bpf_call_gpu_stale_state_v1(
+	uvm_stale_state_v1_decision_ctx_t *decision_ctx)
+{
+	struct gpu_mem_ops *ops;
+	NvS64 ret = NV_GPU_STALE_STATE_V1_ACTION_REJECT;
+
+	rcu_read_lock();
+	ops = rcu_dereference(uvm_ops);
+	if (ops && ops->gpu_stale_state_prefetch_v1)
+		ret = ops->gpu_stale_state_prefetch_v1(decision_ctx);
+	rcu_read_unlock();
+	return ret;
 }
 
 /* PMM eviction policy hook wrappers */
