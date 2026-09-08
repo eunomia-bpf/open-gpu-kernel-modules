@@ -1305,6 +1305,28 @@ typedef struct
 } UVM_DISK_BACKING_QUERY_PARAMS;
 
 //
+// UvmDiskBackingSetGpuPromotion
+//
+// Toggles GPU promotion for a registered disk-backed range. While enabled,
+// a fault on a page that is durably on disk but not resident anywhere is
+// restored through a CPU staging chunk populated from the backing store and
+// left resident on the faulting GPU. While disabled (the default) the
+// restored copy stays CPU-resident. CPU fault restoration is unaffected.
+//
+#define UVM_DISK_BACKING_SET_GPU_PROMOTION                    UVM_IOCTL_BASE(87)
+
+typedef struct
+{
+    NvU32     abiVersion;                                  // IN
+    NvU32     pad0;                                        // IN reserved, must be 0
+    NvU64     rangeStart            NV_ALIGN_BYTES(8);     // IN page aligned
+    NvU64     rangeEnd              NV_ALIGN_BYTES(8);     // IN inclusive
+    NvU32     enable;                                      // IN 0 or 1
+    NvU32     pad1;                                        // IN reserved, must be 0
+    NV_STATUS rmStatus;                                    // OUT
+} UVM_DISK_BACKING_SET_GPU_PROMOTION_PARAMS;
+
+//
 // Temporary ioctls which should be removed before UVM 8 release
 // Number backwards from 2047 - highest custom ioctl function number
 // windows can handle.

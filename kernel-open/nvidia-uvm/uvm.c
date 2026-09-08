@@ -1321,6 +1321,49 @@ out:
     return status;
 }
 
+//
+// UvmDiskBackingSetGpuPromotion - toggles GPU promotion for a registered
+// disk-backed range.
+//
+static NV_STATUS uvm_api_disk_backing_set_gpu_promotion(UVM_DISK_BACKING_SET_GPU_PROMOTION_PARAMS *params, struct file *filp)
+{
+    uvm_va_space_t *va_space = uvm_va_space_get(filp);
+    uvm_va_range_t *va_range;
+    uvm_va_range_managed_t *managed_range;
+    NV_STATUS status = NV_OK;
+
+    if (params->abiVersion != UVM_DISK_BACKING_ABI_VERSION ||
+        params->pad0 != 0 || params->pad1 != 0 || params->enable > 1)
+        return NV_ERR_INVALID_ARGUMENT;
+
+    if (params->rangeStart > params->rangeEnd ||
+        params->rangeStart % PAGE_SIZE != 0 ||
+        (params->rangeEnd + 1) % PAGE_SIZE != 0)
+        return NV_ERR_INVALID_ARGUMENT;
+
+    uvm_va_space_down_write(va_space);
+
+    va_range = uvm_va_range_find(va_space, params->rangeStart);
+    if (!va_range || va_range->node.start != params->rangeStart ||
+        va_range->node.end != params->rangeEnd) {
+        status = NV_ERR_INVALID_ARGUMENT;
+        goto out;
+    }
+
+    managed_range = uvm_va_range_to_managed_or_null(va_range);
+    if (!managed_range) {
+        status = NV_ERR_INVALID_ARGUMENT;
+        goto out;
+    }
+
+    status = uvm_disk_backing_set_gpu_promote(managed_range, params->enable != 0);
+
+out:
+    uvm_va_space_up_write(va_space);
+
+    return status;
+}
+
 static long uvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 {
     switch (cmd)
@@ -1336,6 +1379,7 @@ static long uvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
         UVM_ROUTE_CMD_STACK_INIT_CHECK(UVM_DISK_BACKING_REGISTER,          uvm_api_disk_backing_register);
         UVM_ROUTE_CMD_STACK_INIT_CHECK(UVM_DISK_BACKING_OFFLOAD,           uvm_api_disk_backing_offload);
         UVM_ROUTE_CMD_STACK_INIT_CHECK(UVM_DISK_BACKING_QUERY,             uvm_api_disk_backing_query);
+        UVM_ROUTE_CMD_STACK_INIT_CHECK(UVM_DISK_BACKING_SET_GPU_PROMOTION, uvm_api_disk_backing_set_gpu_promotion);
 
         UVM_ROUTE_CMD_STACK_INIT_CHECK(UVM_PAGEABLE_MEM_ACCESS,            uvm_api_pageable_mem_access);
         UVM_ROUTE_CMD_STACK_INIT_CHECK(UVM_PAGEABLE_MEM_ACCESS_ON_GPU,     uvm_api_pageable_mem_access_on_gpu);

@@ -57,6 +57,11 @@ struct uvm_disk_backing_shared_struct
     // Woken when a pending span completes or fails; used by the OFFLOAD
     // ioctl's wait and by the STATUS ioctl.
     wait_queue_head_t wq;
+
+    // GPU promotion (see uvm_disk_backing.h): shared by every view of the
+    // registered range, so it survives range splits. Written under the VA
+    // space write lock, read on the fault path with the VA space lock held.
+    bool gpu_promote;
 };
 
 // One backing view attached to a single managed range, or to one half of a
@@ -1006,6 +1011,26 @@ bool uvm_disk_backing_sealed_range(uvm_va_block_t *block)
     uvm_disk_backing_t *backing = uvm_disk_backing_from_block(block);
 
     return backing && backing->sealed_read_only;
+}
+
+NV_STATUS uvm_disk_backing_set_gpu_promote(uvm_va_range_managed_t *range,
+                                           bool enable)
+{
+    uvm_disk_backing_t *backing = range->disk_backing;
+
+    uvm_assert_rwsem_locked_write(&range->va_range.va_space->lock);
+
+    if (!backing)
+        return NV_ERR_INVALID_STATE;
+
+    backing->shared->gpu_promote = enable;
+
+    return NV_OK;
+}
+
+bool uvm_disk_backing_gpu_promote(uvm_disk_backing_t *backing)
+{
+    return backing && backing->shared->gpu_promote;
 }
 
 bool uvm_disk_backing_reject_write(uvm_va_block_t *block, NvU64 address, bool is_write)

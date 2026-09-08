@@ -81,6 +81,22 @@ void uvm_disk_backing_release(uvm_disk_backing_t *backing);
 // address; callers on the fault path hold both as appropriate.
 bool uvm_disk_backing_sealed_range(uvm_va_block_t *block);
 
+// GPU promotion state for the whole registered range (shared by all views,
+// including halves created by a split). While set, a fault on a page that
+// is durably on disk but not resident anywhere is restored through a CPU
+// staging chunk populated from the backing store and left resident on the
+// faulting GPU; while clear (the default) the residency selection forces
+// the CPU for such faults and the restored copy stays CPU-resident.
+//
+// The setter requires the VA space lock in write mode; the getter is a
+// plain read, safe on the fault path (same discipline as
+// sealed_read_only).
+NV_STATUS uvm_disk_backing_set_gpu_promote(uvm_va_range_managed_t *range,
+                                           bool enable);
+
+// Current GPU promotion state; false for a NULL backing.
+bool uvm_disk_backing_gpu_promote(uvm_disk_backing_t *backing);
+
 // Reject CPU/GPU write faults into the sealed range. access_type is a
 // uvm_fault_access_type_t; anything above READ is rejected.
 bool uvm_disk_backing_reject_write(uvm_va_block_t *block,

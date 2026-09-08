@@ -3262,12 +3262,52 @@ static NV_STATUS block_populate_pages(uvm_va_block_t *block,
 
         uvm_page_mask_zero(pages_staged);
 
+        // Sealed disk-backed ranges with GPU promotion enabled: pages that
+        // are durably on disk but not resident on any processor cannot be
+        // populated directly on the destination GPU, because a fresh GPU
+        // allocation would carry zeros instead of the durable bytes. Stage
+        // them through the CPU: block_populate_pages_cpu() restores their
+        // content from the backing file into a fresh CPU staging chunk, and
+        // block_copy_resident_pages() moves the bytes to the destination
+        // with a normal CPU->GPU copy, leaving the page resident there.
+        // This must happen before the early return below: for a fully
+        // offloaded range no processor is resident, so the no-staging-source
+        // check would otherwise skip the CPU staging populate entirely.
+        if (uvm_disk_backing_sealed_range(block)) {
+            uvm_disk_backing_t *backing = uvm_disk_backing_from_block(block);
+
+            if (backing && uvm_disk_backing_gpu_promote(backing)) {
+                uvm_page_mask_t *any_resident_mask;
+                uvm_page_index_t staged_page_index;
+
+                any_resident_mask = &block_context->scratch_page_mask;
+                uvm_page_mask_zero(any_resident_mask);
+                for_each_id_in_mask(id, &block->resident)
+                    uvm_page_mask_or(any_resident_mask,
+                                     any_resident_mask,
+                                     uvm_va_block_resident_mask_get(block, id, NUMA_NO_NODE));
+
+                for_each_va_block_page_in_region_mask(staged_page_index, populate_page_mask, region) {
+                    if (!uvm_page_mask_test(any_resident_mask, staged_page_index) &&
+                        uvm_disk_backing_page_on_disk(backing,
+                                                      uvm_va_block_cpu_page_address(block, staged_page_index)))
+                        uvm_page_mask_set(pages_staged, staged_page_index);
+                }
+            }
+        }
+
         // Get the mask of all processors that have resident pages from which
         // the destination cannot copy directly.
         can_copy_from_processors = block_get_can_copy_from_mask(block, dest_id);
         if (!uvm_processor_mask_andnot(tmp_processor_mask, &block->resident, can_copy_from_processors)) {
-            uvm_processor_mask_cache_free(tmp_processor_mask);
-            return status;
+            // No processor is resident that the destination cannot copy from.
+            // If disk promotion queued on-disk pages for the CPU staging
+            // populate below, fall through and stage them; otherwise there is
+            // nothing to stage.
+            if (uvm_page_mask_empty(pages_staged)) {
+                uvm_processor_mask_cache_free(tmp_processor_mask);
+                return status;
+            }
         }
 
         // Compute the pages that will be staged through the CPU by:
@@ -3290,6 +3330,7 @@ static NV_STATUS block_populate_pages(uvm_va_block_t *block,
 
         //   3. Removing any pages not in the populate mask.
         uvm_page_mask_region_clear_outside(pages_staged, region);
+
         cpu_populate_mask = pages_staged;
 
         uvm_processor_mask_cache_free(tmp_processor_mask);
@@ -4956,6 +4997,29 @@ static NV_STATUS block_copy_resident_pages(uvm_va_block_t *block,
 
     // If we get here, that means we were staging the copy through the CPU and
     // we should copy as many pages from the CPU as we copied to the CPU.
+    // Sealed disk-backed ranges with GPU promotion enabled stage on-disk
+    // pages whose CPU staging chunks were populated directly from the
+    // backing store instead of copied in from a resident source; count
+    // those against the invariant as well.
+    if (UVM_ID_IS_GPU(dst_id) && uvm_disk_backing_sealed_range(block)) {
+        uvm_disk_backing_t *backing = uvm_disk_backing_from_block(block);
+
+        if (backing && uvm_disk_backing_gpu_promote(backing)) {
+            uvm_page_mask_t *disk_staged_mask;
+            uvm_processor_id_t rid;
+
+            disk_staged_mask = &block_context->scratch_page_mask;
+            uvm_page_mask_zero(disk_staged_mask);
+            for_each_id_in_mask(rid, &block->resident)
+                uvm_page_mask_or(disk_staged_mask,
+                                 disk_staged_mask,
+                                 uvm_va_block_resident_mask_get(block, rid, NUMA_NO_NODE));
+
+            uvm_page_mask_andnot(disk_staged_mask, pages_staged, disk_staged_mask);
+            pages_copied_to_cpu += uvm_page_mask_region_weight(disk_staged_mask, region);
+        }
+    }
+
     UVM_ASSERT(pages_copied == pages_copied_to_cpu);
 
 out:
@@ -11915,6 +11979,9 @@ uvm_processor_id_t uvm_va_block_select_residency(uvm_va_block_t *va_block,
     // Sealed disk-backed ranges restore from the backing file on the CPU: if
     // the page has no resident copy anywhere, populating a fresh copy on a
     // GPU would silently zero the page instead of reading its durable bytes.
+    // With GPU promotion enabled the page is staged through the CPU instead
+    // (see block_populate_pages()) and ends up resident on the faulting GPU,
+    // so the override is skipped.
     if (UVM_ID_IS_GPU(id) && uvm_disk_backing_sealed_range(va_block)) {
         uvm_disk_backing_t *backing = uvm_disk_backing_from_block(va_block);
         uvm_processor_id_t rid;
@@ -11928,7 +11995,7 @@ uvm_processor_id_t uvm_va_block_select_residency(uvm_va_block_t *va_block,
             }
         }
 
-        if (!resident_anywhere && backing &&
+        if (!uvm_disk_backing_gpu_promote(backing) && !resident_anywhere && backing &&
             uvm_disk_backing_page_on_disk(backing,
                                           uvm_va_block_cpu_page_address(va_block, page_index)))
             id = UVM_ID_CPU;
