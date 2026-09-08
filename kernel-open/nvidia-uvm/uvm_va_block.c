@@ -29,6 +29,7 @@
 #include "uvm_va_space.h"
 #include "uvm_va_range.h"
 #include "uvm_va_block.h"
+#include "uvm_disk_backing.h"
 #include "uvm_hal_types.h"
 #include "uvm_kvmalloc.h"
 #include "uvm_tools.h"
@@ -424,6 +425,17 @@ static uvm_cpu_chunk_t *uvm_cpu_chunk_get_chunk_for_page_resident(uvm_va_block_t
         chunk = uvm_cpu_chunk_get_chunk_for_page(va_block, nid, page_index);
 
     return chunk;
+}
+
+uvm_cpu_chunk_t *uvm_va_block_get_cpu_chunk_for_page(uvm_va_block_t *va_block,
+                                                     uvm_page_index_t page_index)
+{
+    int nid = block_get_page_node_residency(va_block, page_index);
+
+    if (nid == NUMA_NO_NODE)
+        return NULL;
+
+    return uvm_cpu_chunk_get_chunk_for_page(va_block, nid, page_index);
 }
 
 void uvm_cpu_chunk_remove_from_block(uvm_va_block_t *va_block, int nid, uvm_page_index_t page_index)
@@ -1884,6 +1896,105 @@ out:
 // Also maps the page for physical access by all GPUs used by the block, which
 // is required for IOMMU support. Skipped on GPUs without access to CPU memory.
 // e.g., this happens when the Confidential Computing Feature is enabled.
+// Restore the just-allocated chunk's pages from the sealed range's disk
+// backing before the chunk enters the block state. Only pages that are not
+// resident anywhere and are durably on disk are read from the file; every
+// other page keeps the content the allocator gave it (authoritative zeros,
+// or a fresh copy that a pending migration will fill).
+//
+// The VA block lock is dropped around the blocking file read. Returns:
+//  - NV_OK: the chunk's content is valid and it may be added to the block.
+//  - NV_ERR_MORE_PROCESSING_REQUIRED: another thread is hydrating the same
+//    span; the caller must free the chunk and restart under the relocked
+//    block, where the in-progress hydration's chunk will be visible.
+//  - NV_ERR_INVALID_STATE: the read failed, or a page of the region carries
+//    a recorded I/O error; the span's error bits are set so the page is
+//    never served with zero content.
+//
+// Locking: the VA block lock must be held on entry and on every return.
+static NV_STATUS block_hydrate_sealed_range(uvm_va_block_t *block,
+                                            uvm_cpu_chunk_t *chunk,
+                                            uvm_va_block_region_t region,
+                                            uvm_va_block_context_t *block_context)
+{
+    uvm_disk_backing_t *backing = uvm_disk_backing_from_block(block);
+    uvm_va_block_region_t chunk_region;
+    uvm_page_mask_t resident_mask;
+    uvm_page_mask_t hydrate_mask;
+    uvm_page_index_t page_index;
+    uvm_processor_id_t id;
+    NvU64 address;
+    NvU32 run;
+    NV_STATUS status;
+
+    if (!uvm_disk_backing_sealed_range(block))
+        return NV_OK;
+
+    // Pages resident anywhere else carry authoritative content; only pages
+    // that are nowhere resident and durably on disk need the file read.
+    uvm_page_mask_zero(&resident_mask);
+    for_each_id_in_mask(id, &block->resident) {
+        uvm_page_mask_or(&resident_mask,
+                         &resident_mask,
+                         uvm_va_block_resident_mask_get(block, id, NUMA_NO_NODE));
+    }
+
+    uvm_page_mask_init_from_region(&hydrate_mask, region, NULL);
+    uvm_page_mask_andnot(&hydrate_mask, &hydrate_mask, &resident_mask);
+
+    chunk_region = uvm_va_block_chunk_region(block, uvm_cpu_chunk_get_size(chunk), region.first);
+
+    for (page_index = region.first; page_index < region.outer; ) {
+        NvU64 page_addr = uvm_va_block_cpu_page_address(block, page_index);
+
+        // A recorded I/O error means the file does not hold an authoritative
+        // copy of this page: fail explicitly instead of serving zeros.
+        if (uvm_disk_backing_page_error(backing, page_addr))
+            return NV_ERR_INVALID_STATE;
+
+        if (!(uvm_page_mask_test(&hydrate_mask, page_index) &&
+              uvm_disk_backing_page_on_disk(backing, page_addr))) {
+            ++page_index;
+            continue;
+        }
+
+        for (run = 1;
+             page_index + run < region.outer &&
+             !uvm_disk_backing_page_error(backing,
+                                          uvm_va_block_cpu_page_address(block, page_index + run)) &&
+             uvm_page_mask_test(&hydrate_mask, page_index + run) &&
+             uvm_disk_backing_page_on_disk(backing,
+                                           uvm_va_block_cpu_page_address(block, page_index + run));
+             ++run) {
+        }
+
+        address = page_addr;
+
+        if (!uvm_disk_backing_claim_hydrate(backing, address, run)) {
+            uvm_mutex_unlock(&block->lock);
+            uvm_mutex_lock(&block->lock);
+            return NV_ERR_MORE_PROCESSING_REQUIRED;
+        }
+
+        uvm_mutex_unlock(&block->lock);
+        status = uvm_disk_backing_read_pages(backing,
+                                             address,
+                                             chunk->page + (page_index - chunk_region.first),
+                                             run);
+        uvm_mutex_lock(&block->lock);
+
+        if (status != NV_OK) {
+            uvm_disk_backing_hydrate_fail(backing, address, run);
+            return NV_ERR_INVALID_STATE;
+        }
+
+        uvm_disk_backing_hydrate_done(backing, address, run);
+        page_index += run;
+    }
+
+    return NV_OK;
+}
+
 static NV_STATUS block_populate_pages_cpu(uvm_va_block_t *block,
                                           uvm_page_mask_t *populate_page_mask,
                                           uvm_va_block_region_t populate_region,
@@ -2001,6 +2112,18 @@ static NV_STATUS block_populate_pages_cpu(uvm_va_block_t *block,
 
         // A smaller chunk than the maximum size may have been allocated, update the region accordingly.
         region = uvm_va_block_chunk_region(block, uvm_cpu_chunk_get_size(chunk), page_index);
+
+        // Sealed disk-backed ranges restore the chunk content from the
+        // backing file before the chunk can serve a read. The chunk is still
+        // out of block state here; on NV_ERR_MORE_PROCESSING_REQUIRED another
+        // thread is hydrating the same span, so the chunk is released and the
+        // caller's retry sees the chunk that thread installs.
+        status = block_hydrate_sealed_range(block, chunk, region, block_context);
+        if (status != NV_OK) {
+            uvm_cpu_chunk_free(chunk);
+            return status;
+        }
+
         status = block_add_cpu_chunk(block, node_pages_mask, chunk, region);
         if (status != NV_OK)
             return status;
@@ -11789,6 +11912,28 @@ uvm_processor_id_t uvm_va_block_select_residency(uvm_va_block_t *va_block,
                                           hmm_migratable,
                                           read_duplicate);
 
+    // Sealed disk-backed ranges restore from the backing file on the CPU: if
+    // the page has no resident copy anywhere, populating a fresh copy on a
+    // GPU would silently zero the page instead of reading its durable bytes.
+    if (UVM_ID_IS_GPU(id) && uvm_disk_backing_sealed_range(va_block)) {
+        uvm_disk_backing_t *backing = uvm_disk_backing_from_block(va_block);
+        uvm_processor_id_t rid;
+        bool resident_anywhere = false;
+
+        for_each_id_in_mask(rid, &va_block->resident) {
+            if (uvm_page_mask_test(uvm_va_block_resident_mask_get(va_block, rid, NUMA_NO_NODE),
+                                   page_index)) {
+                resident_anywhere = true;
+                break;
+            }
+        }
+
+        if (!resident_anywhere && backing &&
+            uvm_disk_backing_page_on_disk(backing,
+                                          uvm_va_block_cpu_page_address(va_block, page_index)))
+            id = UVM_ID_CPU;
+    }
+
     // If the intended residency doesn't have memory, fall back to the CPU.
     if (!uvm_processor_has_memory(id)) {
         *read_duplicate = false;
@@ -12371,6 +12516,15 @@ NV_STATUS uvm_va_block_check_logical_permissions(uvm_va_block_t *va_block,
     UVM_ASSERT(uvm_hmm_check_context_vma_is_valid(va_block,
                                                   va_block_context->hmm.vma,
                                                   uvm_va_block_region_for_page(page_index)));
+
+    // Sealed disk-backed ranges are read-only for their lifetime: any write
+    // fault from any processor is rejected explicitly instead of being
+    // served by mutating the CPU, GPU, or disk copy.
+    if (access_prot > UVM_PROT_READ_ONLY &&
+        uvm_disk_backing_reject_write(va_block,
+                                      va_block->start + (NvU64)page_index * PAGE_SIZE,
+                                      true))
+        return NV_ERR_INVALID_ACCESS_TYPE;
 
     // CPU permissions are checked later by block_map_cpu_page.
     //

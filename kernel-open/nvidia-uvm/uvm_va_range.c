@@ -29,6 +29,7 @@
 #include "uvm_hal.h"
 #include "uvm_va_range.h"
 #include "uvm_va_block.h"
+#include "uvm_disk_backing.h"
 #include "uvm_kvmalloc.h"
 #include "uvm_map_external.h"
 #include "uvm_perf_thrashing.h"
@@ -476,6 +477,11 @@ static void uvm_va_range_destroy_managed(uvm_va_range_managed_t *managed_range)
     uvm_va_block_t *block_tmp;
     uvm_perf_event_data_t event_data;
     NV_STATUS status;
+
+    // Drop the range's disk backing view, if any. In-flight offload workers
+    // hold their own references, so the shared state survives until they
+    // finish; the range struct itself is freed below regardless.
+    uvm_disk_backing_unregister(managed_range);
 
     if (managed_range->va_range.blocks) {
         // Unmap and drop our ref count on each block
@@ -1265,6 +1271,17 @@ NV_STATUS uvm_va_range_split(uvm_va_range_managed_t *existing_managed_range,
 
     // Finally, update the VA range tree
     uvm_range_tree_split(&va_space->va_range_tree, &existing_managed_range->va_range.node, &new->va_range.node);
+
+    // Split the disk backing view with the range, if one is attached, so the
+    // offload/hydration state survives at every address. A failure tears
+    // both ranges down (uvm_vm_open_failure), which unregisters both views.
+    if (existing_managed_range->disk_backing) {
+        status = uvm_disk_backing_split(existing_managed_range, new);
+        if (status != NV_OK) {
+            uvm_va_range_destroy(&new->va_range, NULL);
+            return status;
+        }
+    }
 
     event_data.range_shrink.range = &new->va_range;
     uvm_perf_event_notify(&va_space->perf_events, UVM_PERF_EVENT_RANGE_SHRINK, &event_data);
@@ -2167,4 +2184,3 @@ out:
     uvm_va_space_up_write(va_space);
     return status;
 }
-

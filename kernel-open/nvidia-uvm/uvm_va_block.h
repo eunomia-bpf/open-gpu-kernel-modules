@@ -2138,6 +2138,14 @@ struct page *uvm_cpu_chunk_get_cpu_page(uvm_va_block_t *va_block, uvm_cpu_chunk_
 // Locking: The va_block lock must be held.
 struct page *uvm_va_block_get_cpu_page(uvm_va_block_t *va_block, uvm_page_index_t page_index);
 
+// Return the CPU chunk of the resident copy at the given page_index from the
+// va_block, on whichever NUMA node it is resident. Managed blocks only: for
+// HMM blocks the caller must know the node. Returns NULL if the page has no
+// resident CPU copy.
+// Locking: The va_block lock must be held.
+uvm_cpu_chunk_t *uvm_va_block_get_cpu_chunk_for_page(uvm_va_block_t *va_block,
+                                                     uvm_page_index_t page_index);
+
 // Physically map a CPU chunk so it is DMA'able from all registered GPUs.
 // nid cannot be NUMA_NO_NODE.
 // Locking: The va_block lock must be held.

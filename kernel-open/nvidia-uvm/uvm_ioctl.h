@@ -1238,6 +1238,73 @@ typedef struct
 } UVM_KV_RECLAIM_CHOOSE_PARAMS;
 
 //
+// UvmDiskBackingRegister
+//
+// Attaches a durable on-disk backing to an existing fully-managed VA range
+// and seals the range read-only for the lifetime of the registration. The
+// range must be page aligned, not a zombie, and must not already have a
+// backing. fileFd must be an open regular file readable and writable; the
+// file bytes [fileOffset, fileOffset + range size) back the range VAs.
+// Existing CPU/GPU write mappings are revoked so the seal applies to them
+// too.
+//
+#define UVM_DISK_BACKING_ABI_VERSION                          1
+
+#define UVM_DISK_BACKING_REGISTER                             UVM_IOCTL_BASE(84)
+
+typedef struct
+{
+    NvU32     abiVersion;                                  // IN
+    NvU32     pad0;                                        // IN reserved, must be 0
+    NvU64     rangeStart            NV_ALIGN_BYTES(8);     // IN page aligned
+    NvU64     rangeEnd              NV_ALIGN_BYTES(8);     // IN inclusive
+    NvU64     fileOffset            NV_ALIGN_BYTES(8);     // IN page aligned
+    NvS32     fileFd;                                      // IN
+    NvU32     pad1;                                        // IN reserved, must be 0
+    NV_STATUS rmStatus;                                    // OUT
+} UVM_DISK_BACKING_REGISTER_PARAMS;
+
+//
+// UvmDiskBackingOffload
+//
+// Asynchronously writes the range pages in [rangeStart, rangeEnd] to the
+// attached backing file and, on success, releases the in-memory copies.
+// Spans must be aligned to VA block granularity and lie inside one
+// registered disk-backed range.
+//
+#define UVM_DISK_BACKING_OFFLOAD                              UVM_IOCTL_BASE(85)
+
+typedef struct
+{
+    NvU32     abiVersion;                                  // IN
+    NvU32     pad0;                                        // IN reserved, must be 0
+    NvU64     rangeStart            NV_ALIGN_BYTES(8);     // IN block aligned
+    NvU64     rangeEnd              NV_ALIGN_BYTES(8);     // IN inclusive
+    NV_STATUS rmStatus;                                    // OUT
+} UVM_DISK_BACKING_OFFLOAD_PARAMS;
+
+//
+// UvmDiskBackingQuery
+//
+// Reports page counts for [rangeStart, rangeEnd] of a registered disk-backed
+// range: total, durably on disk, pending offload, and I/O error.
+//
+#define UVM_DISK_BACKING_QUERY                                UVM_IOCTL_BASE(86)
+
+typedef struct
+{
+    NvU32     abiVersion;                                  // IN
+    NvU32     pad0;                                        // IN reserved, must be 0
+    NvU64     rangeStart            NV_ALIGN_BYTES(8);     // IN page aligned
+    NvU64     rangeEnd              NV_ALIGN_BYTES(8);     // IN inclusive
+    NvU32     totalNumPages;                               // OUT
+    NvU32     onDiskPages;                                 // OUT
+    NvU32     pendingPages;                                // OUT
+    NvU32     errorPages;                                  // OUT
+    NV_STATUS rmStatus;                                    // OUT
+} UVM_DISK_BACKING_QUERY_PARAMS;
+
+//
 // Temporary ioctls which should be removed before UVM 8 release
 // Number backwards from 2047 - highest custom ioctl function number
 // windows can handle.

@@ -283,6 +283,11 @@ struct uvm_va_range_managed_struct
     uvm_va_policy_t policy;
 
     uvm_perf_module_data_desc_t perf_modules_data[UVM_PERF_MODULE_TYPE_COUNT];
+
+    // Optional durable disk backing for this sealed, read-only managed range.
+    // NULL when the range is not disk-backed. The range holds the single
+    // reference; see uvm_disk_backing.h.
+    uvm_disk_backing_t *disk_backing;
 };
 
 // Subclass of va_range state for va_range.type == UVM_VA_RANGE_TYPE_EXTERNAL

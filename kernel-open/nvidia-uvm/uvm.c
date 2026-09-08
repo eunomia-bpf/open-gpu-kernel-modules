@@ -31,6 +31,7 @@
 #include "uvm_va_space_mm.h"
 #include "uvm_va_range.h"
 #include "uvm_va_block.h"
+#include "uvm_disk_backing.h"
 #include "uvm_tools.h"
 #include "uvm_common.h"
 #include "uvm_fd_type.h"
@@ -1141,6 +1142,185 @@ static NV_STATUS uvm_api_kv_reclaim_choose(UVM_KV_RECLAIM_CHOOSE_PARAMS *params,
     return NV_OK;
 }
 
+
+//
+// UvmDiskBackingRegister - attaches a durable on-disk backing to an existing
+// fully-managed VA range and seals it read-only. See uvm_ioctl.h for the
+// parameter contract.
+//
+static NV_STATUS uvm_api_disk_backing_register(UVM_DISK_BACKING_REGISTER_PARAMS *params, struct file *filp)
+{
+    uvm_va_space_t *va_space = uvm_va_space_get(filp);
+    uvm_va_range_t *va_range;
+    uvm_va_range_managed_t *managed_range;
+    struct file *file;
+    NV_STATUS status = NV_OK;
+
+    if (params->abiVersion != UVM_DISK_BACKING_ABI_VERSION ||
+        params->pad0 != 0 || params->pad1 != 0)
+        return NV_ERR_INVALID_ARGUMENT;
+
+    if (params->rangeStart > params->rangeEnd ||
+        params->rangeStart % PAGE_SIZE != 0 ||
+        (params->rangeEnd + 1) % PAGE_SIZE != 0 ||
+        params->fileOffset % PAGE_SIZE != 0 ||
+        params->fileFd < 0)
+        return NV_ERR_INVALID_ARGUMENT;
+
+    file = fget(params->fileFd);
+    if (!file || !S_ISREG(file_inode(file)->i_mode) ||
+        !(file->f_mode & (FMODE_READ | FMODE_WRITE))) {
+        status = NV_ERR_INVALID_ARGUMENT;
+        goto out_file;
+    }
+
+    uvm_va_space_down_write(va_space);
+
+    va_range = uvm_va_range_find(va_space, params->rangeStart);
+    if (!va_range || va_range->node.end != params->rangeEnd) {
+        status = NV_ERR_INVALID_ARGUMENT;
+    } else {
+        managed_range = uvm_va_range_to_managed_or_null(va_range);
+        if (!managed_range)
+            status = NV_ERR_INVALID_ARGUMENT;
+        else
+            // Re-sealing an already-backed range and registering a zombie
+            // range are both rejected inside uvm_disk_backing_register.
+            status = uvm_disk_backing_register(managed_range, file, params->fileOffset);
+    }
+
+    uvm_va_space_up_write(va_space);
+
+out_file:
+    if (file)
+        fput(file);
+
+    return status;
+}
+
+//
+// UvmDiskBackingOffload - asynchronously writes the given block-aligned span
+// of a registered disk-backed range to its backing file and releases the
+// in-memory copies on success.
+//
+static NV_STATUS uvm_api_disk_backing_offload(UVM_DISK_BACKING_OFFLOAD_PARAMS *params, struct file *filp)
+{
+    uvm_va_space_t *va_space = uvm_va_space_get(filp);
+    uvm_va_range_t *va_range;
+    uvm_va_range_managed_t *managed_range;
+    uvm_disk_backing_t *backing;
+    NvU64 block_size = (NvU64)PAGES_PER_UVM_VA_BLOCK * PAGE_SIZE;
+    NvU64 address;
+    NV_STATUS status = NV_OK;
+
+    if (params->abiVersion != UVM_DISK_BACKING_ABI_VERSION || params->pad0 != 0)
+        return NV_ERR_INVALID_ARGUMENT;
+
+    if (params->rangeStart > params->rangeEnd ||
+        params->rangeStart % block_size != 0 ||
+        (params->rangeEnd + 1) % block_size != 0)
+        return NV_ERR_INVALID_ARGUMENT;
+
+    uvm_va_space_down_write(va_space);
+
+    va_range = uvm_va_range_find(va_space, params->rangeStart);
+    if (!va_range || va_range->node.end != params->rangeEnd) {
+        status = NV_ERR_INVALID_ARGUMENT;
+        goto out;
+    }
+
+    managed_range = uvm_va_range_to_managed_or_null(va_range);
+    if (!managed_range) {
+        status = NV_ERR_INVALID_ARGUMENT;
+        goto out;
+    }
+
+    backing = managed_range->disk_backing;
+    if (!backing) {
+        status = NV_ERR_INVALID_STATE;
+        goto out;
+    }
+
+    // One VA block per iteration; each is captured and queued by the backing.
+    for (address = params->rangeStart; address <= params->rangeEnd; address += block_size) {
+        uvm_va_block_t *block = NULL;
+        NV_STATUS block_status = uvm_va_block_find(va_space, address, &block);
+
+        if (block_status != NV_OK || !block) {
+            if (status == NV_OK)
+                status = (block_status != NV_OK) ? block_status : NV_ERR_INVALID_STATE;
+            break;
+        }
+
+        block_status = uvm_disk_backing_offload_block(backing, block);
+        if (block_status != NV_OK && status == NV_OK)
+            status = block_status;
+    }
+
+out:
+    uvm_va_space_up_write(va_space);
+
+    return status;
+}
+
+//
+// UvmDiskBackingQuery - reports the page counts of a registered disk-backed
+// range span.
+//
+static NV_STATUS uvm_api_disk_backing_query(UVM_DISK_BACKING_QUERY_PARAMS *params, struct file *filp)
+{
+    uvm_va_space_t *va_space = uvm_va_space_get(filp);
+    uvm_va_range_t *va_range;
+    uvm_va_range_managed_t *managed_range;
+    uvm_disk_backing_t *backing;
+    uvm_disk_backing_status_t query;
+    NV_STATUS status = NV_OK;
+
+    if (params->abiVersion != UVM_DISK_BACKING_ABI_VERSION || params->pad0 != 0)
+        return NV_ERR_INVALID_ARGUMENT;
+
+    if (params->rangeStart > params->rangeEnd ||
+        params->rangeStart % PAGE_SIZE != 0 ||
+        (params->rangeEnd + 1) % PAGE_SIZE != 0)
+        return NV_ERR_INVALID_ARGUMENT;
+
+    params->totalNumPages = 0;
+    params->onDiskPages = 0;
+    params->pendingPages = 0;
+    params->errorPages = 0;
+
+    uvm_va_space_down_write(va_space);
+
+    va_range = uvm_va_range_find(va_space, params->rangeStart);
+    if (!va_range || va_range->node.end != params->rangeEnd) {
+        status = NV_ERR_INVALID_ARGUMENT;
+        goto out;
+    }
+
+    managed_range = uvm_va_range_to_managed_or_null(va_range);
+    if (!managed_range) {
+        status = NV_ERR_INVALID_ARGUMENT;
+        goto out;
+    }
+
+    backing = managed_range->disk_backing;
+    if (!backing) {
+        status = NV_ERR_INVALID_STATE;
+        goto out;
+    }
+
+    uvm_disk_backing_query(backing, params->rangeStart, params->rangeEnd, &query);
+    params->totalNumPages = query.num_pages;
+    params->onDiskPages = query.on_disk_pages;
+    params->pendingPages = query.pending_pages;
+    params->errorPages = query.error_pages;
+
+out:
+    uvm_va_space_up_write(va_space);
+
+    return status;
+}
+
 static long uvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 {
     switch (cmd)
@@ -1152,6 +1332,10 @@ static long uvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
         UVM_ROUTE_CMD_STACK_NO_INIT_CHECK(UVM_MM_INITIALIZE,               uvm_api_mm_initialize);
         UVM_ROUTE_CMD_STACK_NO_INIT_CHECK(UVM_GPU_STORAGE_DECIDE,          uvm_api_gpu_storage_decide);
         UVM_ROUTE_CMD_ALLOC_NO_INIT_CHECK(UVM_KV_RECLAIM_CHOOSE,           uvm_api_kv_reclaim_choose);
+
+        UVM_ROUTE_CMD_STACK_INIT_CHECK(UVM_DISK_BACKING_REGISTER,          uvm_api_disk_backing_register);
+        UVM_ROUTE_CMD_STACK_INIT_CHECK(UVM_DISK_BACKING_OFFLOAD,           uvm_api_disk_backing_offload);
+        UVM_ROUTE_CMD_STACK_INIT_CHECK(UVM_DISK_BACKING_QUERY,             uvm_api_disk_backing_query);
 
         UVM_ROUTE_CMD_STACK_INIT_CHECK(UVM_PAGEABLE_MEM_ACCESS,            uvm_api_pageable_mem_access);
         UVM_ROUTE_CMD_STACK_INIT_CHECK(UVM_PAGEABLE_MEM_ACCESS_ON_GPU,     uvm_api_pageable_mem_access_on_gpu);
