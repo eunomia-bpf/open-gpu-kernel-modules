@@ -96,6 +96,11 @@ typedef struct
 
     // Updated by the worker: all claimed pages written (or nothing to write).
     bool write_ok;
+
+    // Updated by the worker: the in-memory copies were released (CPU and GPU
+    // PTEs unmapped, PTE updates confirmed, CPU chunk removed from the
+    // block).
+    bool reclaim_ok;
 } uvm_disk_backing_group_t;
 
 static size_t backing_page_index(uvm_disk_backing_t *backing, NvU64 address)
@@ -167,14 +172,16 @@ static void backing_release_claim(uvm_disk_backing_t *backing,
     uvm_mutex_unlock(&backing->shared->state_lock);
 }
 
-// Record the completion of one claimed span. On success the span is marked
+// Record the I/O outcome of one claimed span. On success the span is marked
 // durably on disk and any previous error bits are cleared; on failure the
 // span is left not-on-disk with error bits set so that hydration never serves
-// silently zero-filled data and later offload passes can retry.
-static void backing_region_write_done(uvm_disk_backing_t *backing,
-                                      NvU64 address,
-                                      NvU32 num_pages,
-                                      bool success)
+// silently zero-filled data and later offload passes can retry. The pending
+// bits stay set: offload completion is published only after the worker has
+// released the in-memory copies (backing_region_offload_done).
+static void backing_region_record_write(uvm_disk_backing_t *backing,
+                                        NvU64 address,
+                                        NvU32 num_pages,
+                                        bool success)
 {
     size_t first = backing_page_index(backing, address);
 
@@ -188,11 +195,42 @@ static void backing_region_write_done(uvm_disk_backing_t *backing,
         bitmap_set(backing->shared->io_error, first, num_pages);
     }
 
-    bitmap_clear(backing->shared->pending, first, num_pages);
+    uvm_mutex_unlock(&backing->shared->state_lock);
+}
 
+// Publish offload completion for one claimed span, called only after the
+// worker has resolved the reclamation of the in-memory copies: the span
+// leaves the pending state so QUERY no longer reports it in flight, and the
+// waiters of uvm_disk_backing_wait_offload() may proceed.
+static void backing_region_offload_done(uvm_disk_backing_t *backing,
+                                        NvU64 address,
+                                        NvU32 num_pages)
+{
+    size_t first = backing_page_index(backing, address);
+
+    uvm_mutex_lock(&backing->shared->state_lock);
+    bitmap_clear(backing->shared->pending, first, num_pages);
     uvm_mutex_unlock(&backing->shared->state_lock);
 
     wake_up_all(&backing->shared->wq);
+}
+
+// Record a failed release of one claimed span whose file write succeeded:
+// the in-memory copies are kept resident so no mapping is left pointing at
+// released memory, and the span is moved to the error state so QUERY reports
+// that the offload pass did not complete. The on_disk bits are cleared while
+// the error bits are set, keeping the two states exclusive; a later offload
+// pass rewrites the span and retries the release.
+static void backing_region_reclaim_fail(uvm_disk_backing_t *backing,
+                                        NvU64 address,
+                                        NvU32 num_pages)
+{
+    size_t first = backing_page_index(backing, address);
+
+    uvm_mutex_lock(&backing->shared->state_lock);
+    bitmap_clear(backing->shared->on_disk, first, num_pages);
+    bitmap_set(backing->shared->io_error, first, num_pages);
+    uvm_mutex_unlock(&backing->shared->state_lock);
 }
 
 static void backing_shared_free(nv_kref_t *nv_kref);
@@ -492,7 +530,9 @@ typedef enum
     BACKING_PAGE_ZERO = 0,  // authoritative zero, never backed by the file
     BACKING_PAGE_ON_DISK,   // durable file copy exists
     BACKING_PAGE_PENDING,   // claimed by an in-flight offload worker
-    BACKING_PAGE_ERROR,     // offload I/O failed; not zero, not on disk
+    BACKING_PAGE_ERROR,     // offload pass failed (I/O error, or the
+                            // in-memory copies could not be released); not
+                            // zero, not on disk
     BACKING_PAGE_HYDRATING, // disk->CPU hydration read in progress
 } backing_page_state_t;
 
@@ -793,12 +833,13 @@ static void backing_offload_worker_entry(void *args)
 
         if (!group->write_needed) {
             group->write_ok = true;
-            // The span was already durably backed at capture time; complete
-            // the claim so the page leaves the pending state.
-            backing_region_write_done(backing,
-                                      group->abs_start,
-                                      uvm_cpu_chunk_num_pages(group->chunk),
-                                      true);
+            // The span was already durably backed at capture time; record the
+            // outcome, the pending bits are released after the in-memory
+            // copies are reclaimed below.
+            backing_region_record_write(backing,
+                                        group->abs_start,
+                                        uvm_cpu_chunk_num_pages(group->chunk),
+                                        true);
             continue;
         }
 
@@ -808,10 +849,10 @@ static void backing_offload_worker_entry(void *args)
                                           group->chunk->page,
                                           uvm_cpu_chunk_num_pages(group->chunk)) == NV_OK);
 
-        backing_region_write_done(backing,
-                                  group->abs_start,
-                                  uvm_cpu_chunk_num_pages(group->chunk),
-                                  group->write_ok);
+        backing_region_record_write(backing,
+                                    group->abs_start,
+                                    uvm_cpu_chunk_num_pages(group->chunk),
+                                    group->write_ok);
     }
 
     // Release the CPU copies of the groups that made it to disk: unmap the
@@ -866,23 +907,49 @@ static void backing_offload_worker_entry(void *args)
 
         if (unmap_status != NV_OK) {
             // The pages may still be mapped: keep the CPU copy resident so no
-            // mapping is left pointing at freed memory. A later offload pass
-            // retries the write and the release.
+            // mapping is left pointing at freed memory. The failure is
+            // published with the pending bits below.
             continue;
         }
 
-        // Let the PTE updates complete before the pages may be released.
-        uvm_tracker_wait(&unmap_tracker);
+        // Let the PTE updates complete before the pages may be released; a
+        // failing PTE update means the mappings were not all removed, so the
+        // copy must be kept.
+        if (uvm_tracker_wait(&unmap_tracker) != NV_OK)
+            continue;
 
         uvm_mutex_lock(&block->lock);
 
         // Re-check: the chunk may have been moved by a concurrent CPU->GPU
         // migration (our kref kept the pages valid); only remove it if the
-        // block still points at it.
-        if (uvm_va_block_get_cpu_chunk_for_page(block, group->region.first) == group->chunk)
+        // block still points at it. If the region still carries a CPU chunk
+        // afterwards, the release did not happen and is published as a
+        // failure below.
+        if (uvm_va_block_get_cpu_chunk_for_page(block, group->region.first) == group->chunk) {
             uvm_va_block_remove_cpu_chunks(block, group->region);
+            group->reclaim_ok = true;
+        }
 
         uvm_mutex_unlock(&block->lock);
+    }
+
+    // Publish offload completion only after the reclamation outcome is
+    // resolved, so QUERY pending=0 means the in-memory copies have been
+    // released, or that the failure to release them is visible in the error
+    // counters: a successful write whose release failed moves the span to
+    // the error state (the retained copy stays resident and authoritative,
+    // and a later offload pass rewrites the span and retries the release).
+    for (i = 0; i < desc->num_groups; ++i) {
+        uvm_disk_backing_group_t *group = &desc->groups[i];
+
+        if (group->write_ok && !group->reclaim_ok)
+            backing_region_reclaim_fail(backing,
+                                        group->abs_start,
+                                        uvm_cpu_chunk_num_pages(group->chunk));
+
+        backing_region_offload_done(backing,
+                                    group->abs_start,
+                                    uvm_cpu_chunk_num_pages(group->chunk));
     }
 
     if (block_context)
