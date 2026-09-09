@@ -13217,6 +13217,102 @@ static void block_add_eviction_mappings_entry(void *args)
     UVM_ENTRY_VOID(block_add_eviction_mappings(args));
 }
 
+// Free physical GPU chunks that lost every reference: the whole span of
+// the chunk is non-resident on the owning GPU and no processor holds PTEs
+// for it. This is the state left by the disk backing offload pass once its
+// staging copies moved the pages off the GPUs and its reclamation removed
+// the in-memory copies; without this the chunks would keep pinning their
+// physical GPU memory until the PMM's own LRU eviction ran.
+//
+// The function is a no-op if the block has any UVM-Lite GPU: UVM-Lite
+// mappings to the preferred location are not tracked in the PTE bitmaps
+// (see uvm_va_block_unmap_preferred_location_uvm_lite), so a live UVM-Lite
+// PTE into a chunk cannot be detected from the masks.
+//
+// Otherwise a chunk is released only if:
+//  - it is in the allocated state. Temporarily pinned chunks are still
+//    owned by an in-flight operation, so they are left for a later pass.
+//  - no page of the span is resident on the owning GPU, and neither the
+//    CPU nor any GPU holds PTEs for any page of the span. This also
+//    covers tracked peer mappings of the chunk. The block lock serializes
+//    the bitmap checks with mapping changes; pending GPU work remains
+//    ordered through the block tracker passed to unmap and free below.
+//
+// Pass the block tracker through physical unmap and PMM free, mirroring
+// normal chunk teardown. This helper adds no explicit tracker wait.
+//
+// The chunks are not in PMM-eviction state, so this uses the regular free
+// (uvm_pmm_gpu_free), not uvm_pmm_gpu_mark_chunk_evicted().
+//
+// LOCKING: The caller must hold the va_block lock, and the block must not
+// be dead.
+void uvm_va_block_reclaim_unreferenced_gpu_chunks(uvm_va_block_t *va_block)
+{
+    uvm_gpu_id_t gpu_id;
+
+    UVM_ASSERT(!uvm_va_block_is_hmm(va_block));
+    uvm_assert_mutex_locked(&va_block->lock);
+    UVM_ASSERT(!uvm_va_block_is_dead(va_block));
+
+    if (!uvm_processor_mask_empty(block_get_uvm_lite_gpus(va_block)))
+        return;
+
+    for_each_gpu_id(gpu_id) {
+        uvm_va_block_gpu_state_t *gpu_state = uvm_va_block_gpu_state_get(va_block, gpu_id);
+        uvm_gpu_t *gpu;
+        uvm_va_block_region_t chunk_region;
+        size_t i;
+        size_t num_chunks;
+
+        if (!gpu_state || !gpu_state->chunks)
+            continue;
+
+        gpu = uvm_gpu_get(gpu_id);
+        num_chunks = block_num_gpu_chunks(va_block, gpu);
+        chunk_region.outer = 0;
+
+        for (i = 0; i < num_chunks; ++i) {
+            uvm_gpu_chunk_t *chunk = gpu_state->chunks[i];
+            uvm_chunk_size_t chunk_size;
+            uvm_gpu_id_t peer_id;
+            bool chunk_mapped;
+            size_t chunk_index;
+
+            chunk_index = block_gpu_chunk_index(va_block, gpu, chunk_region.outer, &chunk_size);
+            UVM_ASSERT(chunk_index == i);
+            chunk_region.first = chunk_region.outer;
+            chunk_region.outer = chunk_region.first + chunk_size / PAGE_SIZE;
+
+            if (!chunk || chunk->state != UVM_PMM_GPU_CHUNK_STATE_ALLOCATED)
+                continue;
+
+            if (!uvm_page_mask_region_empty(&gpu_state->resident, chunk_region))
+                continue;
+
+            chunk_mapped = !uvm_page_mask_region_empty(&va_block->cpu.pte_bits[UVM_PTE_BITS_CPU_READ],
+                                                       chunk_region);
+            if (!chunk_mapped) {
+                for_each_gpu_id(peer_id) {
+                    uvm_va_block_gpu_state_t *peer_state = uvm_va_block_gpu_state_get(va_block, peer_id);
+
+                    if (peer_state &&
+                        !uvm_page_mask_region_empty(&peer_state->pte_bits[UVM_PTE_BITS_GPU_READ], chunk_region)) {
+                        chunk_mapped = true;
+                        break;
+                    }
+                }
+            }
+
+            if (chunk_mapped)
+                continue;
+
+            uvm_mmu_chunk_unmap(chunk, &va_block->tracker);
+            uvm_pmm_gpu_free(&gpu->pmm, chunk, &va_block->tracker);
+            gpu_state->chunks[i] = NULL;
+        }
+    }
+}
+
 NV_STATUS uvm_va_block_evict_chunks(uvm_va_block_t *va_block,
                                     uvm_gpu_t *gpu,
                                     uvm_gpu_chunk_t *root_chunk,

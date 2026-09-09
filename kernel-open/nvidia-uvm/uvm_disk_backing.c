@@ -938,6 +938,20 @@ static void backing_offload_worker_entry(void *args)
         uvm_mutex_unlock(&block->lock);
     }
 
+    // Release the physical GPU chunks that no longer back any mapping: the
+    // staging copies moved every offloaded page off the GPUs and the
+    // per-group unmaps removed the PTEs, so chunks whose spans carry no
+    // residency and no mappings are handed back to the GPU's physical
+    // memory manager instead of staying pinned until the PMM's own LRU
+    // eviction runs. The helper skips anything still referenced and is a
+    // no-op when UVM-Lite GPUs are involved, so it is safe even if a
+    // concurrent fault re-hydrated part of the block in the meantime, or a
+    // group's reclamation above failed.
+    uvm_mutex_lock(&block->lock);
+    if (!uvm_va_block_is_dead(block))
+        uvm_va_block_reclaim_unreferenced_gpu_chunks(block);
+    uvm_mutex_unlock(&block->lock);
+
     // Publish offload completion only after the reclamation outcome is
     // resolved, so QUERY pending=0 means the in-memory copies have been
     // released, or that the failure to release them is visible in the error

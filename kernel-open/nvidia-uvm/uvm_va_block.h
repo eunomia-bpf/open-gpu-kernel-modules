@@ -1563,6 +1563,24 @@ NV_STATUS uvm_va_block_evict_chunks(uvm_va_block_t *va_block,
                                     uvm_gpu_chunk_t *root_chunk,
                                     uvm_tracker_t *tracker);
 
+// Frees the physical GPU chunks that no longer carry any reference: every
+// page of the chunk's span is non-resident on the owning GPU and no
+// processor holds PTEs for the span. Chunks that are still resident or
+// mapped (including by a peer GPU) are left untouched. The function is a
+// no-op if the block has any UVM-Lite GPU, whose untracked preferred-
+// location mappings cannot be ruled out from the PTE masks.
+//
+// Used by the disk backing offload worker to release the GPU memory of
+// pages whose data is durably on disk (or in the retained CPU copies) and
+// whose in-memory copies have been reclaimed.
+//
+// No residency, eviction, or mapping state is modified; the caller's
+// migration already left it consistent.
+//
+// LOCKING: The caller must hold the va_block lock, and the block must not
+// be dead.
+void uvm_va_block_reclaim_unreferenced_gpu_chunks(uvm_va_block_t *va_block);
+
 NV_STATUS uvm_test_va_block_inject_error(UVM_TEST_VA_BLOCK_INJECT_ERROR_PARAMS *params, struct file *filp);
 NV_STATUS uvm_test_change_pte_mapping(UVM_TEST_CHANGE_PTE_MAPPING_PARAMS *params, struct file *filp);
 NV_STATUS uvm_test_va_block_info(UVM_TEST_VA_BLOCK_INFO_PARAMS *params, struct file *filp);
